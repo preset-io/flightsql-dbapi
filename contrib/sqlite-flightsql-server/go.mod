@@ -1,6 +1,6 @@
 module github.com/influxdata/flightsql-dbapi/contrib/sqlite-flightsql-server
 
-go 1.19
+go 1.25
 
 require (
 	github.com/apache/arrow/go/v11 v11.0.0-20230109125925-11d286eafb72
@@ -9,7 +9,7 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.0.4 // indirect
-	github.com/apache/thrift v0.16.0 // indirect
+	github.com/apache/thrift v0.23.0 // indirect
 	github.com/goccy/go-json v0.9.11 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
