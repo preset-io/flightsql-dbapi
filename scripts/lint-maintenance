@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+grep -Eq '^\* +@aminghadersohi([[:space:]]|$)' CODEOWNERS
+grep -Fq '**Primary DRI and CODEOWNER:** [`@aminghadersohi`]' MAINTENANCE.md
+! grep -Eq 'TBD|DRI placeholder|assign the DRI' CODEOWNERS MAINTENANCE.md
