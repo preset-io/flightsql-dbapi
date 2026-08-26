@@ -20,21 +20,23 @@ flightsql-dbapi @ git+https://github.com/preset-io/flightsql-dbapi.git@<full-com
 
 Add the same line to the consumer constraints file and use that constraint for
 every pip install/upgrade in the image build. A requirement in only one layer is
-not a replacement guarantee. After installation, run the verifier from a
-verified checkout (or copy the standalone script into the consumer):
+not a source guarantee. After installation, copy the self-contained verifier
+from a separately verified checkout and invoke it in isolated mode:
 
 ```console
-python scripts/verify-installed-provenance \
+python -I /trusted/verify-installed-provenance \
   --expected-commit <full-commit-sha> \
   --expected-version 0.2.3+preset.1
 ```
 
 This rejects the public 0.2.2 build, any other version, index installs without
 PEP 610 provenance, a different repository, a branch/tag request, and a commit
-other than the asserted full SHA. The installed console command
-`flightsql-verify-provenance` performs the same check, but the standalone script
-is preferable for a replacement detector because it remains available if the
-wrong distribution removed that entry point.
+other than the asserted full SHA when the recorded source mode is Git/archive.
+It also hashes installer-recorded files without importing `flightsql`. The
+installed console command `flightsql-verify-provenance` is only a convenience
+smoke check because the package being inspected supplies that command and its
+Python implementation. Use `--json` when automation needs the explicit
+`commit_verified` result.
 
 For an uncommitted local candidate, create `requirements-local.txt` in the
 Superset Docker directory and serve a freshly built source distribution. For
@@ -44,11 +46,14 @@ example:
 flightsql-dbapi @ http://docker.for.mac.host.internal:8000/dist/flightsql_dbapi-0.2.3+preset.1.tar.gz
 ```
 
-Local wheels and sdists do not encode their source commit. For a controlled
-test, record the artifact SHA-256 and invoke the verifier with both
+Install local wheels/sdists with `python -m pip`; uv local artifact mode is
+rejected because its `direct_url.json` may not record the artifact digest. Local
+artifacts do not encode their source commit. For a controlled test, record the
+artifact SHA-256 before installation and invoke the verifier with both
 `--expected-artifact-sha256 <digest>` and `--allow-local-artifact`; this mode
-proves artifact identity only, so the build system must separately attest its
-source commit. Production source-archive installs use a full-SHA GitHub URL plus
+checks artifact identity and deliberately reports that it did **not** verify the
+supplied commit. The build system must separately attest the source commit.
+Production source-archive installs use a full-SHA GitHub URL plus
 `#sha256=<digest>` and do not use the local-artifact escape hatch.
 
 - Run superset using docker compose:

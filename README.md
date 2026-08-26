@@ -37,24 +37,33 @@ operation that can resolve dependencies:
 python -m pip install --constraint constraints-flightsql.txt --requirement requirements.txt
 ```
 
-Without the constraint, a later broad install/upgrade can replace this fork
-because it deliberately retains the public distribution name. After installing,
-assert the exact version, repository, and 40-character commit recorded by PEP
-610:
+Without the constraint, a later broad install/upgrade can select the public
+distribution because this fork deliberately retains its name. After installing,
+use a trusted copy of the self-contained verifier as the primary assertion path:
 
 ```console
-flightsql-verify-provenance --expected-commit <full-commit-sha>
+python -I /trusted/verify-installed-provenance \
+  --expected-commit <full-commit-sha>
 ```
 
-The standalone `scripts/verify-installed-provenance` can be copied into
-`superset-shell` or run from a verified checkout of this repository, so the
-check still fails clearly if a public package replacement removes the console
-command. When Git is unavailable,
-pin the equivalent full-SHA source archive **and its SHA-256**, then pass the
-same digest to the verifier. Do not publish this fork as `flightsql-dbapi` on a
-public package index. The internal fork version is `0.2.3+preset.1`; see
-[MAINTENANCE.md](MAINTENANCE.md) for collision semantics, provenance rules, and
-the supported matrix.
+Copy `scripts/verify-installed-provenance` from a separately verified checkout
+into `superset-shell`; it does not import or execute the target package. It
+checks installer RECORD hashes, version metadata, and PEP 610 assertions. The
+installed `flightsql-verify-provenance` console command is convenience-only:
+its entry point and implementation live inside the package being checked.
+Neither path is a signature or a defense against an actor able to rewrite the
+installed files, RECORD, and `direct_url.json`, and neither proves which package
+a later manipulated `sys.path` will import. Run the trusted script with `-I` in
+a fresh, access-controlled environment. `--json` reports `commit_verified` and
+the exact scope for automation.
+
+When Git is unavailable, pin the equivalent full-SHA source archive **and its
+SHA-256**, then pass the same digest to the verifier. Local wheel/sdist identity
+mode requires a pip installation and reports `commit_verified: false`; uv local
+artifact metadata is rejected because its PEP 610 shape may omit the digest.
+Do not publish this fork as `flightsql-dbapi` on a public package index. The
+internal fork version is `0.2.3+preset.1`; see
+[MAINTENANCE.md](MAINTENANCE.md) for the complete threat boundary and matrix.
 
 ## Usage
 
@@ -88,6 +97,11 @@ and precision do not depend on pandas being installed. A container that embeds a
 nanosecond temporal value but cannot be reconstructed safely is rejected with
 `NotSupportedError` rather than returning environment-dependent values.
 
+`Cursor.executemany()` is compatibility-oriented rather than a bulk transport:
+it prepares once, sends one single-row parameter record/RPC per tuple, discards
+any returned rows, and does not report an aggregate affected-row count. Use a
+backend-native ingestion path when batching or throughput is required.
+
 ### SQLAlchemy
 
 ```python3
@@ -116,6 +130,21 @@ executable SQL string. Expanding and empty `IN` expressions are covered against
 the bundled SQLite Flight SQL server; that is not a claim that every live
 DataFusion/InfluxDB version accepts every empty-set SQL form, so consumer staging
 must cover queries that depend on it.
+
+Every non-NULL value in literal mode must have a concrete SQLAlchemy type,
+either from a typed column expression or an explicit `bindparam(..., type_=...)`.
+An untyped (`NullType`) non-NULL value fails closed because it cannot be quoted
+unambiguously. `None` is the exception: `String`, `Integer`, and `NullType` binds
+all compile to the SQL expression `NULL` (never the string `'NULL'`) during both
+normal execution and `literal_binds` compilation. SQLAlchemy executemany with
+post-compile literal parameters is not supported; execute individual statements
+or enable the server's prepared-statement feature.
+
+If a server ignores `GetTables(include_schema=True)`, the dialect preserves its
+table names and keeps `has_table()` correct, while emitting one actionable
+warning per engine. Column reflection may be empty until that server returns the
+serialized Arrow schemas required by Flight SQL. A genuinely empty catalog is
+returned without that degraded-reflection warning.
 
 ### Custom Dialects
 

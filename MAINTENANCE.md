@@ -10,13 +10,17 @@ correctness, security, compatibility, and dependency maintenance needed by its
 Superset distribution indefinitely.
 
 - **Owning organization:** Preset
-- **Primary DRI and CODEOWNER:** [`@aminghadersohi`](https://github.com/aminghadersohi)
-- **Owner verification:** on 2026-08-26, GitHub's authenticated organization
-  membership API reported an active direct `preset-io` membership and the
-  repository collaborator API reported write access. Revalidate both before a
-  consumer pin or release; if either check fails, assigning a replacement DRI is
-  a hard gate.
-- **Review gate:** the DRI coordinates each `superset-shell` pin and must obtain
+- **Maintenance function:** FlightSQL fork maintenance for the Preset Superset
+  distribution
+- **Current maintenance coordinator:** [`@aminghadersohi`](https://github.com/aminghadersohi)
+- **GitHub assignment status:** no multi-member team or repository permission is
+  claimed here. On 2026-08-26 the authenticated API exposed real Preset teams,
+  but the repository-team endpoint returned 404 and team/repository permission
+  checks required unavailable organization-admin scope. A repository admin
+  should recheck before the consumer pin. Until a write-capable multi-member
+  team is actually verified, CI enforces a nonempty CODEOWNERS file plus these
+  structured maintenance fields without inferring access from a team name.
+- **Review gate:** the coordinator manages each `superset-shell` pin and must obtain
   review from a `superset-shell` dependency owner. TLS/auth changes additionally
   require a Preset security reviewer. No rewritten compatibility series should
   open a PR until a different engineer has independently approved it.
@@ -47,12 +51,26 @@ post-compile `KeyError`; 1.4.6 handles every occurrence and is covered by the
 repeated-bind cache regression. The dialect does not claim compatibility with
 1.4.0–1.4.5.
 
+The non-prepared compiler requires a concrete SQLAlchemy type for every
+non-NULL literal value; untyped non-NULL binds are rejected. A `None` value is
+handled separately by the compiler and emitted as SQL `NULL` for String,
+Integer, and NullType binds on both declared SQLAlchemy floors. SQLAlchemy
+executemany is not available for these post-compile literal parameters, and the
+DB API's direct `executemany()` implementation sends one prepared RPC per row
+rather than a true bulk parameter batch.
+
 The bundled SQLite Flight SQL reference server proves the DB API transport,
 reflection contracts, literal/prepared compiler paths, and installed-wheel
 entry point. It does **not** certify production InfluxDB/IOx or DataFusion
 semantics, real TLS certificate validation, or live Basic/Bearer authentication.
 Changes in those areas require bounded unit coverage here and a staging smoke
 test by the consuming service before its pin moves.
+
+Reflection treats a successful zero-row GetTables result as an empty catalog.
+If a nonempty result ignores `include_schema`, names and `has_table()` remain
+available and one warning per dialect explains that columns may be unavailable.
+Malformed included schemas are isolated to their rows; GetTables, DoGet, and
+reader transport failures are never converted into an empty catalog.
 
 DB API nanosecond temporal normalization supports timestamp, time64, and
 duration values recursively through list, large-list, fixed-size-list, struct,
@@ -87,14 +105,31 @@ remains the release channel:
 5. Record the tested SHA and matrix result in the consumer change.
 
 The consumer must repeat the direct reference in a constraints file and pass it
-to every resolver invocation. After installation, run
-`scripts/verify-installed-provenance --expected-commit <sha>` from a trusted copy
-of this repository (or the installed console equivalent). The verifier requires
-the exact internal version and PEP 610 provenance from this repository at the
-full requested commit. An archive additionally requires its exact SHA-256. A
-local wheel/sdist is accepted only in explicit artifact-test mode with an
-externally recorded digest because its `direct_url.json` cannot prove which
-source commit built it.
+to every resolver invocation. After installation, copy the self-contained
+`scripts/verify-installed-provenance` from a separately verified checkout and
+run it with `python -I` as the primary consumer path. It does not import the
+target package: it checks the exact PEP 440-normalized internal version,
+installer RECORD hashes, and PEP 610 Git/archive assertions. An archive
+additionally requires its externally recorded SHA-256. `--json` exposes the
+verified scope without relying on prose.
+
+The installed `flightsql-verify-provenance` console script is convenience-only,
+because its entry point and implementation are package files under inspection.
+RECORD checking detects missing, injected, partially changed, or inconsistent
+installed files, but RECORD and PEP 610 metadata are not signed. An actor able to
+write site-packages can rewrite code, RECORD, `INSTALLER`, and `direct_url.json`
+together; a manipulated runtime `sys.path` can also import a different package
+after verification. The trusted boundary therefore includes the standalone
+script, Python interpreter, `packaging` dependency, externally stored expected
+SHA/digest, resolver inputs, and filesystem access controls. Run in a fresh
+environment and do not describe this consistency assertion as general
+replacement or compromise detection.
+
+A local wheel/sdist is accepted only in explicit artifact-test mode after pip
+installation with an externally recorded digest. uv is rejected causally
+because its local-artifact `direct_url.json` shapes may omit that digest. The
+result verifies artifact identity and sets `commit_verified` to false: the
+supplied expected commit is context, not evidence of what built the artifact.
 
 The distribution name remains `flightsql-dbapi` because Superset requirements,
 the `flightsql` import package, and SQLAlchemy entry-point metadata already use
@@ -108,14 +143,15 @@ explicit packaging, migration, security, and ownership review.
 Under PEP 440 it sorts after public `0.2.3` but before public `0.2.4`, and a
 specifier such as `==0.2.3` also admits the local version. A resolver or later
 unconstrained upgrade can therefore select a public build. The local suffix is
-diagnostic only; replacement protection comes from the direct-reference
-constraint, immutable full SHA, archive/artifact digest where applicable, and
-the post-install provenance assertion. Never treat version equality alone as
+diagnostic only. Layered source controls are the direct-reference constraint,
+immutable full SHA, archive/artifact digest where applicable, fresh-environment
+installation, and the scoped post-install assertion. They do not turn mutable
+installed metadata into an attestation. Never treat version equality alone as
 proof of source.
 
 ## Dependency and security cadence
 
-- During the first full work week of each month, the DRI checks supported
+- During the first full work week of each month, the maintenance coordinator checks supported
   Python, SQLAlchemy 2.x, PyArrow, protobuf, build, test, and GitHub Action
   versions. Reviewed upper-version pins in CI are updated together with a full
   matrix run.
