@@ -19,6 +19,13 @@ def test_sqlalchemy_dependency_supports_1_4_and_2_x():
     assert Version("3.0") not in sqlalchemy.specifier
 
 
+def test_provenance_version_normalizer_is_a_runtime_dependency():
+    dependencies = (Requirement(value) for value in requires("flightsql-dbapi") or [])
+    packaging = next(dependency for dependency in dependencies if dependency.name == "packaging")
+
+    assert Version("21.3") in packaging.specifier
+
+
 def test_sqlalchemy_entrypoint_registers_documented_driver_name():
     entrypoints = {entrypoint.name: entrypoint.value for entrypoint in distribution("flightsql-dbapi").entry_points}
 
@@ -75,6 +82,7 @@ engine.dispose()
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
 
     assert completed.returncode == 0, completed.stderr

@@ -27,12 +27,12 @@ classifiers = [
 dependencies = [
     "sqlalchemy>=1.4.6,<3.0",
     "pyarrow>=16.0.0",
-    "protobuf>=4.21.12"
+    "protobuf>=4.21.12",
+    "packaging>=21.3"
 ]
 
 [project.optional-dependencies]
 test = [
-    "packaging",
     "pytest",
     "pytest-cov"
 ]

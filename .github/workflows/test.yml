@@ -98,16 +98,17 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/wheel-tests"
           cp -R tests "${RUNNER_TEMP}/wheel-tests/tests"
+          cp -R scripts "${RUNNER_TEMP}/wheel-tests/scripts"
           cd "${RUNNER_TEMP}/wheel-tests"
           SQLALCHEMY_SILENCE_UBER_WARNING=1 \
             "${RUNNER_TEMP}/installed/bin/python" -m pytest -q tests
-      - name: Assert exact local artifact identity
+      - name: Assert exact local artifact identity (not its commit)
         env:
           EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           wheel=$(realpath dist/*.whl)
           digest=$(sha256sum "${wheel}" | cut -d' ' -f1)
-          "${RUNNER_TEMP}/installed/bin/flightsql-verify-provenance" \
+          "${RUNNER_TEMP}/installed/bin/python" -I scripts/verify-installed-provenance \
             --expected-commit "${EXPECTED_COMMIT}" \
             --expected-artifact-sha256 "${digest}" \
             --allow-local-artifact
@@ -219,13 +220,14 @@ jobs:
           PY
 
               artifact_digest=$(sha256sum "${artifact}" | cut -d' ' -f1)
-              "${environment}/bin/flightsql-verify-provenance" \
+              "${environment}/bin/python" -I scripts/verify-installed-provenance \
                 --expected-commit "${EXPECTED_COMMIT}" \
                 --expected-artifact-sha256 "${artifact_digest}" \
                 --allow-local-artifact
 
               mkdir -p "${test_root}"
               cp -R tests "${test_root}/tests"
+              cp -R scripts "${test_root}/scripts"
               (
                 cd "${test_root}"
                 INTEGRATION=1 SQLALCHEMY_SILENCE_UBER_WARNING=1 \
