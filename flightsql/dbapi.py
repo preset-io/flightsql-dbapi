@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
@@ -13,6 +14,15 @@ paramstyle = "qmark"
 apilevel = "2.0"
 
 ExecuteParams = Union[Tuple[Any, ...], List[Any]]
+
+
+@dataclass(frozen=True)
+class TableMetadataResult:
+    """Names and optional Arrow schemas returned by one GetTables request."""
+
+    table_names: List[str]
+    columns_by_name: Optional[Dict[str, List[Dict]]]
+    included_schema_supported: bool
 
 
 def check_result(f):
@@ -167,22 +177,29 @@ class Connection:
         info = self.client.get_tables(
             table_name_filter_pattern=table_name, db_schema_filter_pattern=schema, include_schema=True
         )
-        metadata = self._table_metadata_from_info(info)
+        metadata = self._table_metadata_from_info(info).columns_by_name
         if metadata is None:
             return []
         return metadata.get(table_name, [])
 
     @check_closed
-    def flightsql_get_table_metadata(self, schema: Optional[str] = None) -> Optional[Dict[str, List[Dict]]]:
-        """Get all reflectable table names and included schemas in one request.
+    def flightsql_get_table_metadata(self, schema: Optional[str] = None) -> TableMetadataResult:
+        """Get table names and any included Arrow schemas in one request.
 
-        ``None`` means the server did not provide bulk included-schema rows and
-        the dialect must use its compatibility fallback. An empty dictionary
-        means the server provided the response shape and no table was
-        reflectable. Flight transport errors deliberately propagate.
+        A successful zero-row response is an empty catalog. A nonempty response
+        that omits/does not populate ``table_schema`` is a degraded names-only
+        result. Flight transport errors deliberately propagate.
         """
         info = self.client.get_tables(db_schema_filter_pattern=schema, include_schema=True)
-        return self._table_metadata_from_info(info)
+        result = self._table_metadata_from_info(info)
+        if not result.table_names and result.columns_by_name == {}:
+            # Some servers answer the unsupported include_schema variant with
+            # zero rows. A names-only request is the only way to distinguish
+            # that behavior from a genuinely empty catalog.
+            table_names = self.flightsql_get_table_names(schema)
+            if table_names:
+                return TableMetadataResult(table_names, None, False)
+        return result
 
     @check_closed
     def flightsql_get_table_names(self, schema: Optional[str] = None) -> List[str]:
@@ -229,17 +246,28 @@ class Connection:
     def _tables_from_info(self, info: Any) -> List[pa.Table]:
         return [self.client.do_get(endpoint.ticket).read_all() for endpoint in info.endpoints]
 
-    def _table_metadata_from_info(self, info: Any) -> Optional[Dict[str, List[Dict]]]:
+    def _table_metadata_from_info(self, info: Any) -> TableMetadataResult:
         tables = self._tables_from_info(info)
         if not tables:
-            return None
-        if any("table_schema" not in table.column_names for table in tables):
-            return None
+            return TableMetadataResult([], {}, True)
         if sum(table.num_rows for table in tables) == 0:
-            return None
+            return TableMetadataResult([], {}, True)
+
+        table_names: List[str] = []
+        for table in tables:
+            if "table_name" in table.column_names:
+                table_names.extend(name for name in table.column("table_name").to_pylist() if isinstance(name, str))
+        # Keep stable server order while protecting has_table() and reflection
+        # caches from duplicate endpoints/rows.
+        table_names = list(dict.fromkeys(table_names))
+
+        if any(table.num_rows and "table_schema" not in table.column_names for table in tables):
+            return TableMetadataResult(table_names, None, False)
 
         metadata: Dict[str, List[Dict]] = {}
         for table in tables:
+            if table.num_rows == 0:
+                continue
             names = table.column("table_name").to_pylist()
             schemas = table.column("table_schema").to_pylist()
             for name, serialized_schema in zip(names, schemas):
@@ -253,7 +281,9 @@ class Connection:
                     # read_all transport failures continue to propagate.
                     continue
                 metadata[name] = column_specs(schema)
-        return metadata
+        if table_names and not metadata:
+            return TableMetadataResult(table_names, None, False)
+        return TableMetadataResult(table_names, metadata, True)
 
     @property
     def features(self) -> Dict[str, str]:
@@ -476,6 +506,10 @@ def _normalized_list_storage(array: pa.Array) -> Tuple[pa.Array, pa.Array]:
 def _union_buffer_array(array: pa.UnionArray, arrow_type: pa.DataType, buffer_index: int) -> pa.Array:
     buffer = array.buffers()[buffer_index]
     if buffer is None:
+        if len(array) == 0:
+            # Arrow IPC may represent a zero-length primitive union buffer as
+            # absent rather than as an allocated zero-byte buffer.
+            return pa.array([], type=arrow_type)
         raise NotSupportedError(f"union array of type {array.type} is missing buffer {buffer_index}")
     logical = pa.Array.from_buffers(arrow_type, len(array), [None, buffer], offset=array.offset)
     # Union factories interpret child offsets as part of the new logical
@@ -490,29 +524,26 @@ def _normalize_temporal_union_array(array: pa.UnionArray, target_type: pa.DataTy
     children = [
         _normalize_temporal_array(array.field(index), f"{path}.{field.name}") for index, field in enumerate(arrow_type)
     ]
-    field_names = [field.name for field in arrow_type]
-
     if arrow_type.mode == "dense":
         offsets = _union_buffer_array(array, pa.int32(), 2)
-        normalized = pa.UnionArray.from_dense(
-            type_ids,
-            offsets,
-            children,
-            field_names=field_names,
-            type_codes=arrow_type.type_codes,
+        normalized = pa.Array.from_buffers(
+            target_type,
+            len(array),
+            [None, type_ids.buffers()[1], offsets.buffers()[1]],
+            children=children,
         )
     elif arrow_type.mode == "sparse":
-        normalized = pa.UnionArray.from_sparse(
-            type_ids,
-            [pa.concat_arrays([child]) for child in children],
-            field_names=field_names,
-            type_codes=arrow_type.type_codes,
+        normalized = pa.Array.from_buffers(
+            target_type,
+            len(array),
+            [None, type_ids.buffers()[1]],
+            children=[pa.concat_arrays([child]) for child in children],
         )
     else:
         raise NotSupportedError(f"unsupported Arrow union mode {arrow_type.mode!r} at {path}")
 
-    if normalized.type != target_type:
-        raise NotSupportedError(f"normalizing union type {arrow_type} at {path} cannot safely preserve field metadata")
+    if not isinstance(normalized, pa.UnionArray):
+        raise NotSupportedError(f"normalizing union type {arrow_type} at {path} did not produce a union array")
     return normalized
 
 

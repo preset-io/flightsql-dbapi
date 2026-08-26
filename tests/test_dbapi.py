@@ -10,6 +10,7 @@ from sqlalchemy.sql import sqltypes
 from flightsql.dbapi import (
     Connection,
     ParameterRecordBuilder,
+    TableMetadataResult,
     dbapi_results,
     resolve_sql_type,
 )
@@ -352,6 +353,49 @@ def test_dbapi_results_recursively_normalizes_dense_and_sparse_unions():
     assert type(sparse_values[0][0]) is time
 
 
+@pytest.mark.parametrize("mode", ["dense", "sparse"])
+@pytest.mark.parametrize("empty_position", ["leading", "trailing"])
+def test_dbapi_results_accepts_empty_union_chunks_with_absent_buffers_without_dropping_rows(mode, empty_position):
+    fields = [
+        pa.field("timestamp", pa.timestamp("ns", tz="UTC"), nullable=False, metadata={b"source": b"rpc"}),
+        pa.field("duration", pa.duration("ns"), nullable=True),
+    ]
+    union_type = pa.union(fields, mode=mode, type_codes=[5, 7])
+    empty_buffers = [None, None, None] if mode == "dense" else [None, None]
+    empty = pa.Array.from_buffers(
+        union_type,
+        0,
+        empty_buffers,
+        children=[pa.array([], type=field.type) for field in fields],
+    )
+    if mode == "dense":
+        populated = pa.Array.from_buffers(
+            union_type,
+            1,
+            [None, pa.array([5], type=pa.int8()).buffers()[1], pa.array([0], type=pa.int32()).buffers()[1]],
+            children=[
+                pa.array([1_234_567_890], type=fields[0].type),
+                pa.array([], type=fields[1].type),
+            ],
+        )
+    else:
+        populated = pa.Array.from_buffers(
+            union_type,
+            1,
+            [None, pa.array([5], type=pa.int8()).buffers()[1]],
+            children=[
+                pa.array([1_234_567_890], type=fields[0].type),
+                pa.array([None], type=fields[1].type),
+            ],
+        )
+
+    batches = [empty, populated] if empty_position == "leading" else [populated, empty]
+    table = pa.Table.from_batches([pa.record_batch([batch], names=["value"]) for batch in batches])
+    values, _ = dbapi_results(table)
+
+    assert values == [[datetime(1970, 1, 1, 0, 0, 1, 234_567, tzinfo=timezone.utc)]]
+
+
 def test_dbapi_results_explicitly_rejects_unsupported_nested_temporal_container():
     encoded = pa.RunEndEncodedArray.from_arrays(
         [2],
@@ -423,21 +467,60 @@ def test_get_table_metadata_uses_one_included_schema_request_and_filters_unrefle
     client = Client()
     connection = Connection(client)
 
-    assert connection.flightsql_get_table_metadata("public") == {
-        "alpha": [
-            {
-                "name": "id",
-                "type": sqltypes.BIGINT,
-                "default": None,
-                "comment": None,
-                "nullable": False,
-            }
-        ]
-    }
+    assert connection.flightsql_get_table_metadata("public") == TableMetadataResult(
+        ["alpha", "stale", "malformed"],
+        {
+            "alpha": [
+                {
+                    "name": "id",
+                    "type": sqltypes.BIGINT,
+                    "default": None,
+                    "comment": None,
+                    "nullable": False,
+                }
+            ]
+        },
+        True,
+    )
     assert client.calls == [
         ("get_tables", {"db_schema_filter_pattern": "public", "include_schema": True}),
         ("do_get", b"ticket"),
     ]
+
+
+def test_get_table_metadata_distinguishes_names_only_response_from_empty_catalog():
+    names_only = pa.table({"table_name": ["alpha", "beta"]})
+    empty = pa.table({"table_name": pa.array([], type=pa.string())})
+
+    class Reader:
+        def __init__(self, table):
+            self.table = table
+
+        def read_all(self):
+            return self.table
+
+    class Client:
+        def __init__(self, included_schema_table, names_table=None):
+            self.included_schema_table = included_schema_table
+            self.names_table = names_table if names_table is not None else included_schema_table
+            self.requested_include_schema = True
+
+        def get_tables(self, **kwargs):
+            self.requested_include_schema = kwargs.get("include_schema", False)
+            return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
+
+        def do_get(self, ticket):
+            assert ticket == b"ticket"
+            table = self.included_schema_table if self.requested_include_schema else self.names_table
+            return Reader(table)
+
+    assert Connection(Client(names_only)).flightsql_get_table_metadata("public") == TableMetadataResult(
+        ["alpha", "beta"], None, False
+    )
+    assert Connection(Client(empty, names_only)).flightsql_get_table_metadata("public") == TableMetadataResult(
+        ["alpha", "beta"], None, False
+    )
+    assert Connection(Client(empty)).flightsql_get_table_metadata("public") == TableMetadataResult([], {}, True)
 
 
 def test_get_table_metadata_does_not_mask_transport_errors():
@@ -449,6 +532,24 @@ def test_get_table_metadata_does_not_mask_transport_errors():
             raise RuntimeError("transport unavailable")
 
     with pytest.raises(RuntimeError, match="transport unavailable"):
+        Connection(Client()).flightsql_get_table_metadata()
+
+
+def test_empty_included_schema_response_does_not_mask_names_rpc_errors():
+    class Reader:
+        def read_all(self):
+            return pa.table({"table_name": pa.array([], type=pa.string())})
+
+    class Client:
+        def get_tables(self, **kwargs):
+            if not kwargs.get("include_schema", False):
+                raise RuntimeError("names transport unavailable")
+            return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
+
+        def do_get(self, ticket):
+            return Reader()
+
+    with pytest.raises(RuntimeError, match="names transport unavailable"):
         Connection(Client()).flightsql_get_table_metadata()
 
 

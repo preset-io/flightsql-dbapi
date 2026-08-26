@@ -1,12 +1,14 @@
+import warnings
 from typing import Any, Callable, Dict, MutableMapping, Sequence, Tuple
 
 from sqlalchemy import exc, pool
 from sqlalchemy.dialects import registry
 from sqlalchemy.engine import URL, default, reflection
-from sqlalchemy.sql import compiler
+from sqlalchemy.sql import compiler, elements
 
 import flightsql.flightsql_pb2 as flightsql
 from flightsql.client import FlightSQLClient
+from flightsql.dbapi import TableMetadataResult
 
 feature_prefix = "feature-"
 
@@ -100,6 +102,7 @@ class FlightSQLDialect(default.DefaultDialect):
     # documented FlightSQLDialect extension point remains warning-free.
     import_dbapi = classmethod(_import_flightsql_dbapi)
     dbapi = classmethod(_import_flightsql_dbapi)  # type: ignore[assignment]
+    _degraded_reflection_warning_emitted = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -158,23 +161,44 @@ class FlightSQLDialect(default.DefaultDialect):
     @reflection.cache
     def get_table_names(self, connection, schema=None, **kwargs):
         info_cache = kwargs.get("info_cache")
-        metadata = connection.connection.flightsql_get_table_metadata(schema)
-        if metadata is not None:
-            if info_cache is not None:
-                info_cache[(_TABLE_METADATA_CACHE_NAMESPACE, schema)] = metadata
-            return list(metadata)
+        result = connection.connection.flightsql_get_table_metadata(schema)
+        if not isinstance(result, TableMetadataResult):
+            # Keep the documented dialect extension point tolerant of DB API
+            # adapters written against the earlier internal dictionary shape.
+            if result is None:
+                table_names = connection.connection.flightsql_get_table_names(schema)
+                result = TableMetadataResult(table_names, None, False)
+            else:
+                result = TableMetadataResult(list(result), result, True)
+        if result.columns_by_name is not None and info_cache is not None:
+            info_cache[(_TABLE_METADATA_CACHE_NAMESPACE, schema)] = result.columns_by_name
+        if result.table_names and not result.included_schema_supported:
+            self._warn_degraded_reflection(schema)
+            reflectable_names = [
+                table_name
+                for table_name in result.table_names
+                if self.get_columns(connection, table_name, schema=schema, info_cache=info_cache)
+            ]
+            # Per-table included schemas can filter server-internal/stale rows
+            # when available. If every probe is empty, included schemas are
+            # unsupported globally: preserve the names rather than blacking
+            # reflection out.
+            if reflectable_names:
+                return reflectable_names
+        return result.table_names
 
-        table_names = connection.connection.flightsql_get_table_names(schema)
-        # Some Flight SQL servers report internal/stale tables for which an
-        # included Arrow schema is unavailable, and some older servers cannot
-        # return schemas for an unfiltered GetTables request. Use per-table
-        # calls only for that compatibility fallback. The shared info_cache
-        # prevents reflection from requesting the same columns a second time.
-        return [
-            table_name
-            for table_name in table_names
-            if self.get_columns(connection, table_name, schema=schema, info_cache=info_cache)
-        ]
+    def _warn_degraded_reflection(self, schema):
+        if self._degraded_reflection_warning_emitted:
+            return
+        self._degraded_reflection_warning_emitted = True
+        scope = "all schemas" if schema is None else f"schema {schema!r}"
+        warnings.warn(
+            "Flight SQL GetTables(include_schema=True) returned names but no usable Arrow table_schema metadata "
+            f"for {scope}. Table names and has_table() remain available, but reflected columns may be empty; "
+            "configure or upgrade the server to honor include_schema and return serialized Arrow schemas.",
+            exc.SAWarning,
+            stacklevel=3,
+        )
 
     @reflection.cache
     def get_schema_names(self, connection, **kwargs):
@@ -240,6 +264,16 @@ class LiteralBindCompiler(compiler.SQLCompiler):
             **kwargs,
         )
 
+    def render_literal_value(self, value, type_):
+        # SQLAlchemy 1.4.6 passes execution-time None values directly to the
+        # type's literal processor. String/Integer/NullType processors either
+        # fail or can produce a non-SQL value. Compile the SQL NULL expression
+        # through SQLAlchemy's visitor contract; never return user text such as
+        # the string "NULL" from a type processor.
+        if value is None:
+            return self.process(elements.Null._instance())
+        return super().render_literal_value(value, type_)
+
 
 class DataFusionDialect(FlightSQLDialect):
     """
@@ -247,10 +281,9 @@ class DataFusionDialect(FlightSQLDialect):
     transport layer and for metadata lookups. It is specifically tuned for the
     baseline configuration of a DataFusion execution engine.
 
-    This Dialect is currently using `information_schema` via ad-hoc queries to answer
-    metadata questions. In this state DataFusionDialect is only useful against SQL
-    engine's that support `infromation_schema`. This behavior will be swapped
-    out for correct Flight SQL metadata calls when we have them working (see TODOs).
+    Metadata reflection uses the Flight SQL GetTables/GetDbSchemas and key RPCs.
+    Servers that ignore GetTables(include_schema=True) can still provide table
+    names and has_table results, but cannot provide complete column reflection.
     """
 
     name = "datafusion"

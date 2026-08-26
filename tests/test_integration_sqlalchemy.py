@@ -4,6 +4,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session, declarative_base
 from sqlalchemy.schema import MetaData, Table
 from sqlalchemy.sql import compiler
+from sqlalchemy.sql.sqltypes import NullType
 
 import flightsql.flightsql_pb2 as flightsql
 from flightsql.sqlalchemy import FEATURE_PREPARED_STATEMENTS, LiteralBindCompiler
@@ -138,6 +139,67 @@ def test_integration_literal_binds_compile_string_is_directly_executable_and_esc
         assert "one'' OR 1=1 --" in str(hostile)
         assert connection.exec_driver_sql(str(hostile)).all() == []
 
+    engine.dispose()
+
+
+@pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)
+@pytest.mark.parametrize(
+    ("column_name", "bind_type", "operator", "expected_ids"),
+    [
+        ("keyName", String(), "equality", []),
+        ("keyName", String(), "is-not-distinct", [4]),
+        ("keyName", String(), "is-distinct", [1, 2, 3]),
+        ("id", Integer(), "equality", []),
+        ("id", Integer(), "is-not-distinct", []),
+        ("id", Integer(), "is-distinct", [1, 2, 3, 4]),
+        ("keyName", NullType(), "equality", []),
+        ("keyName", NullType(), "is-not-distinct", [4]),
+        ("keyName", NullType(), "is-distinct", [1, 2, 3]),
+    ],
+    ids=lambda value: type(value).__name__ if not isinstance(value, str) else value,
+)
+def test_integration_none_typed_binds_execute_as_sql_null_in_normal_and_literal_modes(
+    column_name, bind_type, operator, expected_ids
+):
+    engine = new_sqlalchemy_engine()
+    reflected = Table("intTable", MetaData(), autoload_with=engine)
+    candidate = bindparam("candidate", type_=bind_type)
+    value_column = reflected.c[column_name]
+    if operator == "equality":
+        predicate = value_column == candidate
+    elif operator == "is-not-distinct":
+        predicate = value_column.isnot_distinct_from(candidate)
+    else:
+        predicate = value_column.is_distinct_from(candidate)
+    statement = select(reflected.c.id).where(predicate).order_by(reflected.c.id)
+
+    with engine.connect() as connection:
+        assert [row[0] for row in connection.execute(statement, {"candidate": None})] == expected_ids
+        literal = statement.params(candidate=None).compile(
+            dialect=engine.dialect,
+            compile_kwargs={"literal_binds": True},
+        )
+        assert "NULL" in str(literal)
+        assert "'NULL'" not in str(literal)
+        assert [row[0] for row in connection.exec_driver_sql(str(literal))] == expected_ids
+
+    engine.dispose()
+
+
+@pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)
+def test_integration_none_and_non_null_typed_binds_share_cache_without_reusing_rendered_sql():
+    engine = new_sqlalchemy_engine()
+    reflected = Table("intTable", MetaData(), autoload_with=engine)
+    statement = select(reflected.c.id).where(
+        reflected.c["keyName"].isnot_distinct_from(bindparam("candidate", type_=String()))
+    )
+    compiled_cache = {}
+
+    with engine.connect().execution_options(compiled_cache=compiled_cache) as connection:
+        assert connection.execute(statement, {"candidate": "one"}).scalar_one() == 1
+        assert connection.execute(statement, {"candidate": None}).scalar_one() == 4
+
+    assert len(compiled_cache) == 1
     engine.dispose()
 
 
