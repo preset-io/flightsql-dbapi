@@ -1,46 +1,87 @@
-## Dev instructions
+# Development instructions
 
-## Pre-requisites 
-- Python version 3.11.x or greater
-- Clone superset: https://github.com/apache/superset
+## Prerequisites
 
-## Superset Directory
-- Create a requirements-local.txt in the docker directory. This will specify version of the package you want to build.
+- One of the supported Python versions (3.10 through 3.14)
+- Docker with Compose for the SQLite Flight SQL reference server
+- A Superset checkout when testing the consumer integration
 
-E.g.
+See [MAINTENANCE.md](MAINTENANCE.md) for the complete compatibility matrix and
+the limits of the reference-server coverage.
+
+## Superset directory
+
+Preset's durable installation path is an immutable commit, not the public PyPI
+project. Add a full reviewed SHA to the consumer requirements:
+
+```text
+flightsql-dbapi @ git+https://github.com/preset-io/flightsql-dbapi.git@<full-commit-sha>
+```
+
+Add the same line to the consumer constraints file and use that constraint for
+every pip install/upgrade in the image build. A requirement in only one layer is
+not a replacement guarantee. After installation, run the verifier from a
+verified checkout (or copy the standalone script into the consumer):
+
+```console
+python scripts/verify-installed-provenance \
+  --expected-commit <full-commit-sha> \
+  --expected-version 0.2.3+preset.1
+```
+
+This rejects the public 0.2.2 build, any other version, index installs without
+PEP 610 provenance, a different repository, a branch/tag request, and a commit
+other than the asserted full SHA. The installed console command
+`flightsql-verify-provenance` performs the same check, but the standalone script
+is preferable for a replacement detector because it remains available if the
+wrong distribution removed that entry point.
+
+For an uncommitted local candidate, create `requirements-local.txt` in the
+Superset Docker directory and serve a freshly built source distribution. For
+example:
 
 ```
-$ cat docker/requirements-local.txt
-http://docker.for.mac.host.internal:8000/dist/flightsql_dbapi-0.2.0.tar.gz#egg=flightsql-dbapi
+flightsql-dbapi @ http://docker.for.mac.host.internal:8000/dist/flightsql_dbapi-0.2.3+preset.1.tar.gz
 ```
+
+Local wheels and sdists do not encode their source commit. For a controlled
+test, record the artifact SHA-256 and invoke the verifier with both
+`--expected-artifact-sha256 <digest>` and `--allow-local-artifact`; this mode
+proves artifact identity only, so the build system must separately attest its
+source commit. Production source-archive installs use a full-SHA GitHub URL plus
+`#sha256=<digest>` and do not use the local-artifact escape hatch.
 
 - Run superset using docker compose:
 
 `docker-compose -f ./docker-compose-non-dev.yml up`
 
-## Building the flightsql-dbapi
+## Building `flightsql-dbapi`
 
 - run `make build`
 
 - expose a http server: `python3 -m http.server 8000`
 
-To verify that docker is communiciating on port 8000 you should see requests such as this in the logs: 
+To verify that Docker is communicating on port 8000, check the HTTP server log
+for a request for the exact artifact you built.
 
-127.0.0.1 - - [15/Feb/2023 12:43:25] "GET /dist/flightsql_dbapi-0.2.1.tar.gz HTTP/1.1" 200 -
-
-## Testing it on Superset:
+## Testing it on Superset
 
 - Select other as the type and name appropriately
 
-- Provide a URI: 
+- Provide a URI:
 
 `datafusion+flightsql://${host}:${port}/?bucket-name=${my-bucket}&token=${my-token}`
 
-- Create a chart - select add dataset and select your named database and schema.
+- Create a chart, add a dataset, and select the named database and schema.
+
+This exercise is a consumer smoke test. Use a real staging backend for changes
+to DataFusion/InfluxDB, TLS, or authentication; the repository's SQLite server
+does not prove those production semantics.
 
 ## Dependency Management
 
-- Handle dependencies using direnv and a .envrc, this sets your venv as a pre-requisite to all other make targets.
+- Handle dependencies using `direnv` and an `.envrc`; this sets the virtual
+  environment used by the Make targets.
 
 - `brew install direnv`
 

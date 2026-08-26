@@ -1,6 +1,6 @@
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, MutableMapping, Sequence, Tuple
 
-from sqlalchemy import pool
+from sqlalchemy import exc, pool
 from sqlalchemy.dialects import registry
 from sqlalchemy.engine import URL, default, reflection
 from sqlalchemy.sql import compiler
@@ -13,13 +13,52 @@ feature_prefix = "feature-"
 FEATURE_PREPARED_STATEMENTS = "sqlalchemy-prepared-statements"
 FEATURE_PRIMARY_KEYS = "sqlalchemy-primary-keys"
 
+_TABLE_METADATA_CACHE_NAMESPACE = "flightsql-table-metadata"
+
+_TRUE_QUERY_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_QUERY_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+
+def _import_flightsql_dbapi(_dialect_cls):
+    import flightsql as dbapi
+
+    return dbapi
+
+
+def _dbapi_loader_function(name: str, value: Any) -> Callable[..., Any]:
+    """Return a DBAPI classmethod's function or reject an ambiguous override."""
+    if not isinstance(value, classmethod):
+        raise TypeError(f"{name} must be declared with @classmethod")
+    return value.__func__
+
+
+def _parse_boolean_query_value(name: str, value: str = "") -> bool:
+    normalized = value.strip().lower()
+    if normalized in _TRUE_QUERY_VALUES:
+        return True
+    if normalized in _FALSE_QUERY_VALUES:
+        return False
+    choices = ", ".join(
+        "<empty>" if choice == "" else choice for choice in sorted(_TRUE_QUERY_VALUES | _FALSE_QUERY_VALUES)
+    )
+    raise exc.ArgumentError(f"invalid boolean value for {name!r}: {value!r}; expected one of: {choices}")
+
 
 def client_from_url(url: URL) -> FlightSQLClient:
     fields = url.translate_connect_args(username="user")
 
-    metadata = {k.lower(): v for k, v in url.query.items()}
-    insecure = bool(metadata.pop("insecure", None))
-    disable_server_verification = bool(metadata.pop("disable_server_verification", None))
+    # SQLAlchemy represents repeated query parameters as tuples. Flight RPC
+    # metadata accepts a single value per key, so preserve the last value in
+    # the same way FlightSQLClient resolves duplicate call-option headers.
+    metadata: Dict[str, str] = {
+        key.lower(): value if isinstance(value, str) else value[-1] for key, value in url.query.items()
+    }
+    insecure = _parse_boolean_query_value("insecure", metadata.pop("insecure", ""))
+    disable_server_verification = _parse_boolean_query_value(
+        "disable_server_verification", metadata.pop("disable_server_verification", "")
+    )
+    if insecure and disable_server_verification:
+        raise exc.ArgumentError("insecure and disable_server_verification cannot both be true")
     token = metadata.pop("token", None)
 
     features = {}
@@ -56,11 +95,37 @@ class FlightSQLDialect(default.DefaultDialect):
         flightsql.SQL_IDENTIFIER_QUOTE_CHAR,
     ]
 
-    @classmethod
-    def dbapi(cls):
-        import flightsql as dbapi
+    # SQLAlchemy 2 only recognizes import_dbapi when it is present directly on
+    # the concrete dialect class. Install the hook on every subclass so the
+    # documented FlightSQLDialect extension point remains warning-free.
+    import_dbapi = classmethod(_import_flightsql_dbapi)
+    dbapi = classmethod(_import_flightsql_dbapi)  # type: ignore[assignment]
 
-        return dbapi
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        direct_import = cls.__dict__.get("import_dbapi")
+        direct_legacy = cls.__dict__.get("dbapi")
+
+        if direct_import is not None and direct_legacy is not None:
+            import_loader = _dbapi_loader_function("import_dbapi", direct_import)
+            legacy_loader = _dbapi_loader_function("dbapi", direct_legacy)
+            if import_loader is not legacy_loader:
+                raise TypeError("define only import_dbapi or dbapi; SQLAlchemy 1.4 and 2.x must use one loader")
+            loader = import_loader
+        elif direct_import is not None:
+            loader = _dbapi_loader_function("import_dbapi", direct_import)
+        elif direct_legacy is not None:
+            loader = _dbapi_loader_function("dbapi", direct_legacy)
+        else:
+            inherited_import = getattr(cls, "import_dbapi")
+            loader = inherited_import.__func__
+
+        # SQLAlchemy 2 requires import_dbapi directly on the concrete class,
+        # while SQLAlchemy 1.4 calls dbapi. Rebind one canonical loader under
+        # both names so inherited custom loaders and their keyword signatures
+        # remain identical across every generation of a dialect hierarchy.
+        cls.import_dbapi = classmethod(loader)
+        cls.dbapi = classmethod(loader)
 
     def connect(self, *args, **kwargs):
         return self.dbapi.connect(*args, **kwargs)
@@ -78,34 +143,59 @@ class FlightSQLDialect(default.DefaultDialect):
         self.supports_delete = not read_only
         self.supports_alter = not read_only
 
-    def create_connect_args(self, url: URL) -> List:
+    def create_connect_args(self, url: URL) -> Tuple[Sequence[Any], MutableMapping[str, Any]]:
         client = client_from_url(url)
-        return [[client], {}]
+        return [client], {}
 
     @reflection.cache
-    def get_columns(self, connection, table, schema=None, **kwargs):
-        return connection.connection.flightsql_get_columns(table, schema)
+    def get_columns(self, connection, table_name, schema=None, **kwargs):
+        info_cache = kwargs.get("info_cache")
+        metadata_key = (_TABLE_METADATA_CACHE_NAMESPACE, schema)
+        if info_cache is not None and metadata_key in info_cache:
+            return info_cache[metadata_key].get(table_name, [])
+        return connection.connection.flightsql_get_columns(table_name, schema)
 
     @reflection.cache
     def get_table_names(self, connection, schema=None, **kwargs):
-        return connection.connection.flightsql_get_table_names(schema)
+        info_cache = kwargs.get("info_cache")
+        metadata = connection.connection.flightsql_get_table_metadata(schema)
+        if metadata is not None:
+            if info_cache is not None:
+                info_cache[(_TABLE_METADATA_CACHE_NAMESPACE, schema)] = metadata
+            return list(metadata)
+
+        table_names = connection.connection.flightsql_get_table_names(schema)
+        # Some Flight SQL servers report internal/stale tables for which an
+        # included Arrow schema is unavailable, and some older servers cannot
+        # return schemas for an unfiltered GetTables request. Use per-table
+        # calls only for that compatibility fallback. The shared info_cache
+        # prevents reflection from requesting the same columns a second time.
+        return [
+            table_name
+            for table_name in table_names
+            if self.get_columns(connection, table_name, schema=schema, info_cache=info_cache)
+        ]
 
     @reflection.cache
     def get_schema_names(self, connection, **kwargs):
         return connection.connection.flightsql_get_schema_names()
 
     @reflection.cache
-    def has_table(self, connection, table, schema=None, **kwargs):
-        return table in self.get_table_names(connection, schema)
+    def has_table(self, connection, table_name, schema=None, **kwargs):
+        return table_name in self.get_table_names(
+            connection,
+            schema=schema,
+            info_cache=kwargs.get("info_cache"),
+        )
 
-    def get_indexes(self, connection, table_name, schema, **kwargs):
+    def get_indexes(self, connection, table_name, schema=None, **kwargs):
         return []
 
     def get_pk_constraint(self, connection, table_name, schema=None, **kwargs):
         conn = connection.connection
         primary_keys_enabled = conn.features.get(FEATURE_PRIMARY_KEYS)
         if primary_keys_enabled != "on":
-            return []
+            return {"constrained_columns": [], "name": None}
 
         columns = conn.flightsql_get_primary_keys(table_name, schema=schema)
         if len(columns) == 0:
@@ -121,12 +211,34 @@ class FlightSQLDialect(default.DefaultDialect):
 
 
 class LiteralBindCompiler(compiler.SQLCompiler):
-    # Force bind parameters to be replaced by their underlying value. IOx
-    # doesn't support prepared statements so we'll need to do perform literal
-    # binding of the parameters. This should *not* be considered safe.
+    # Render bind parameters into the SQL immediately before execution. IOx
+    # does not support prepared statements, but SQLAlchemy's post-compile
+    # literal tokens keep cached statements independent of prior values.
     # TODO: Remove this when we're able to support prepared statements.
+    def visit_empty_set_expr(self, element_types, **kwargs):
+        # SQLAlchemy 1.4's backend-neutral compiler requires third-party
+        # dialects to supply this expression. Keep it valid as the contents of
+        # both scalar and tuple IN clauses; SQLAlchemy 2 can use it as well.
+        columns = ", ".join("1" for _ in element_types)
+        return f"SELECT {columns} WHERE 1 != 1"
+
     def visit_bindparam(self, bindparam, within_columns_clause=False, literal_binds=False, **kwargs):
-        return super().visit_bindparam(bindparam, within_columns_clause, True, **kwargs)
+        if literal_binds:
+            kwargs["literal_execute"] = False
+            return super().visit_bindparam(
+                bindparam,
+                within_columns_clause=within_columns_clause,
+                literal_binds=True,
+                **kwargs,
+            )
+
+        kwargs["literal_execute"] = True
+        return super().visit_bindparam(
+            bindparam,
+            within_columns_clause=within_columns_clause,
+            literal_binds=False,
+            **kwargs,
+        )
 
 
 class DataFusionDialect(FlightSQLDialect):

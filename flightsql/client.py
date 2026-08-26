@@ -332,6 +332,12 @@ def create_flight_client(
     metadata: Optional[Dict[str, str]] = None,
     **flight_client_kwargs: Any,
 ) -> Tuple[flight.FlightClient, List[Tuple[bytes, bytes]]]:
+    for name, value in (("insecure", insecure), ("disable_server_verification", disable_server_verification)):
+        if value is not None and not isinstance(value, bool):
+            raise TypeError(f"{name} must be a bool or None, not {type(value).__name__}")
+    if insecure and disable_server_verification:
+        raise ValueError("insecure and disable_server_verification cannot both be true")
+
     protocol = "tls"
     if insecure:
         protocol = "tcp"

@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Run the packaged provenance verifier without importing the checkout."""
+
+import runpy
+from pathlib import Path
+
+runpy.run_path(
+    Path(__file__).resolve().parents[1] / "flightsql" / "provenance.py",
+    run_name="__main__",
+)
