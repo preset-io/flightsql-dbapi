@@ -102,7 +102,7 @@ jobs:
           cd "${RUNNER_TEMP}/wheel-tests"
           SQLALCHEMY_SILENCE_UBER_WARNING=1 \
             "${RUNNER_TEMP}/installed/bin/python" -m pytest -q tests
-      - name: Assert exact local artifact identity (not its commit)
+      - name: Hash referenced local artifact file (not its commit/build linkage)
         env:
           EXPECTED_COMMIT: ${{ github.sha }}
         run: |

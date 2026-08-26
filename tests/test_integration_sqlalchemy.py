@@ -1,5 +1,17 @@
+import warnings
+from pathlib import Path
+
 import pytest
-from sqlalchemy import Column, Integer, String, bindparam, create_engine, event, select
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    bindparam,
+    create_engine,
+    event,
+    select,
+    tuple_,
+)
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session, declarative_base
 from sqlalchemy.schema import MetaData, Table
@@ -59,7 +71,9 @@ def test_integration_metadata_reflect_handles_tables_without_column_metadata():
     engine = new_sqlalchemy_engine()
     metadata = MetaData()
 
-    metadata.reflect(bind=engine)
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        metadata.reflect(bind=engine)
 
     assert "intTable" in metadata.tables
     assert [column.name for column in metadata.tables["intTable"].columns] == [
@@ -68,6 +82,10 @@ def test_integration_metadata_reflect_handles_tables_without_column_metadata():
         "value",
         "foreignId",
     ]
+    assert "sqlite_sequence" not in metadata.tables
+    degraded = [item for item in captured if "incomplete Arrow table_schema metadata" in str(item.message)]
+    assert len(degraded) == 1
+    assert Path(degraded[0].filename).resolve() == Path(__file__).resolve()
     engine.dispose()
 
 
@@ -218,6 +236,34 @@ def test_integration_sqlalchemy_generated_empty_in_is_executable_on_reference_se
         assert "POSTCOMPILE" not in str(compiled)
         assert connection.exec_driver_sql(str(compiled)).all() == []
 
+    engine.dispose()
+
+
+@pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)
+def test_integration_empty_tuple_expanding_bind_is_executable_and_cache_safe():
+    engine = new_sqlalchemy_engine()
+    table = Table("intTable", MetaData(), autoload_with=engine)
+    candidates = bindparam("candidates", expanding=True)
+    statement = select(table.c.id).where(tuple_(table.c.id, table.c["keyName"]).in_(candidates)).order_by(table.c.id)
+    compiled_cache = {}
+    executed = []
+
+    def capture_sql(_connection, _cursor, sql, parameters, _context, _executemany):
+        if "WHERE" in sql:
+            executed.append(sql)
+
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    with engine.connect().execution_options(compiled_cache=compiled_cache) as connection:
+        assert connection.execute(statement, {"candidates": [(1, "one")]}).scalar_one() == 1
+        assert connection.execute(statement, {"candidates": []}).all() == []
+        assert connection.execute(statement, {"candidates": ()}).all() == []
+        assert connection.execute(statement, {"candidates": [(2, "zero")]}).scalar_one() == 2
+
+    assert len(compiled_cache) == 1
+    assert "IN ((1, 'one'))" in executed[0]
+    assert "IN (SELECT 1, 1 WHERE 1 != 1)" in executed[1]
+    assert "IN (SELECT 1, 1 WHERE 1 != 1)" in executed[2]
+    assert "IN ((2, 'zero'))" in executed[3]
     engine.dispose()
 
 

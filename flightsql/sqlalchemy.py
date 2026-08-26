@@ -1,4 +1,6 @@
+import inspect
 import warnings
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, MutableMapping, Sequence, Tuple
 
 from sqlalchemy import exc, pool
@@ -17,8 +19,35 @@ FEATURE_PRIMARY_KEYS = "sqlalchemy-primary-keys"
 
 _TABLE_METADATA_CACHE_NAMESPACE = "flightsql-table-metadata"
 
+
+@dataclass(frozen=True)
+class _TableColumnCacheEntry:
+    status: str
+    columns: Tuple[Dict[str, Any], ...] = ()
+
+
+_MISSING_TABLE = _TableColumnCacheEntry("missing")
+_UNREFLECTABLE_TABLE = _TableColumnCacheEntry("unreflectable")
+
 _TRUE_QUERY_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_QUERY_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+
+def _reflection_warning_stacklevel() -> int:
+    """Point warnings through SQLAlchemy wrappers to the consumer callsite."""
+    stack = inspect.stack(context=0)
+    try:
+        for stacklevel, frame_info in enumerate(stack[1:], start=1):
+            module_name = frame_info.frame.f_globals.get("__name__", "")
+            if module_name == __name__ or module_name.startswith("sqlalchemy."):
+                continue
+            if frame_info.filename == "<string>":
+                continue
+            return stacklevel
+    finally:
+        # Frame objects retain locals; release them after this rare warning.
+        del stack
+    return 2
 
 
 def _import_flightsql_dbapi(_dialect_cls):
@@ -102,7 +131,6 @@ class FlightSQLDialect(default.DefaultDialect):
     # documented FlightSQLDialect extension point remains warning-free.
     import_dbapi = classmethod(_import_flightsql_dbapi)
     dbapi = classmethod(_import_flightsql_dbapi)  # type: ignore[assignment]
-    _degraded_reflection_warning_emitted = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -153,10 +181,13 @@ class FlightSQLDialect(default.DefaultDialect):
     @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kwargs):
         info_cache = kwargs.get("info_cache")
-        metadata_key = (_TABLE_METADATA_CACHE_NAMESPACE, schema)
-        if info_cache is not None and metadata_key in info_cache:
-            return info_cache[metadata_key].get(table_name, [])
-        return connection.connection.flightsql_get_columns(table_name, schema)
+        cache_key = self._column_cache_key(schema, table_name)
+        entry = info_cache.get(cache_key) if info_cache is not None else None
+        if not isinstance(entry, _TableColumnCacheEntry):
+            entry = self._probe_table_columns(connection, table_name, schema)
+            if info_cache is not None:
+                info_cache[cache_key] = entry
+        return self._columns_from_cache_entry(entry, table_name, schema)
 
     @reflection.cache
     def get_table_names(self, connection, schema=None, **kwargs):
@@ -170,34 +201,107 @@ class FlightSQLDialect(default.DefaultDialect):
                 result = TableMetadataResult(table_names, None, False)
             else:
                 result = TableMetadataResult(list(result), result, True)
-        if result.columns_by_name is not None and info_cache is not None:
-            info_cache[(_TABLE_METADATA_CACHE_NAMESPACE, schema)] = result.columns_by_name
-        if result.table_names and not result.included_schema_supported:
-            self._warn_degraded_reflection(schema)
-            reflectable_names = [
-                table_name
-                for table_name in result.table_names
-                if self.get_columns(connection, table_name, schema=schema, info_cache=info_cache)
-            ]
-            # Per-table included schemas can filter server-internal/stale rows
-            # when available. If every probe is empty, included schemas are
-            # unsupported globally: preserve the names rather than blacking
-            # reflection out.
-            if reflectable_names:
-                return reflectable_names
-        return result.table_names
 
-    def _warn_degraded_reflection(self, schema):
-        if self._degraded_reflection_warning_emitted:
+        # A cache entry is qualified by both schema and table.  This prevents
+        # identically named tables in different schemas from sharing columns,
+        # while retaining the one-bulk-RPC fast path for complete metadata.
+        columns_by_name = result.columns_by_name or {}
+        for table_name, columns in columns_by_name.items():
+            self._cache_table_columns(info_cache, schema, table_name, columns)
+
+        unresolved = [name for name in dict.fromkeys(result.table_names) if name not in columns_by_name]
+        if not unresolved and result.included_schema_supported:
+            return list(dict.fromkeys(result.table_names))
+
+        names = [name for name in dict.fromkeys(result.table_names) if name in columns_by_name]
+        recovered = 0
+        unreflectable = 0
+        stale = 0
+        for table_name in unresolved:
+            entry = self._probe_table_columns(connection, table_name, schema)
+            if info_cache is not None:
+                info_cache[self._column_cache_key(schema, table_name)] = entry
+            if entry.status == "missing":
+                stale += 1
+                continue
+            names.append(table_name)
+            if entry.status == "columns":
+                recovered += 1
+            else:
+                unreflectable += 1
+
+        if result.table_names and (unresolved or not result.included_schema_supported):
+            self._warn_degraded_reflection(
+                schema,
+                probes=len(unresolved),
+                recovered=recovered,
+                unreflectable=unreflectable,
+                stale=stale,
+            )
+        return names
+
+    @staticmethod
+    def _column_cache_key(schema, table_name):
+        return (_TABLE_METADATA_CACHE_NAMESPACE, "columns", schema, table_name)
+
+    def _cache_table_columns(self, info_cache, schema, table_name, columns):
+        if info_cache is not None:
+            info_cache[self._column_cache_key(schema, table_name)] = _TableColumnCacheEntry("columns", tuple(columns))
+
+    def _probe_table_columns(self, connection, table_name, schema):
+        dbapi_connection = connection.connection
+        probe = getattr(dbapi_connection, "flightsql_get_table_metadata_for_table", None)
+        if callable(probe):
+            result = probe(table_name, schema)
+            if not isinstance(result, TableMetadataResult):
+                raise exc.InvalidRequestError(
+                    "flightsql_get_table_metadata_for_table() must return TableMetadataResult"
+                )
+            columns_by_name = result.columns_by_name or {}
+            if table_name in columns_by_name:
+                return _TableColumnCacheEntry("columns", tuple(columns_by_name[table_name]))
+            if table_name in result.table_names:
+                return _UNREFLECTABLE_TABLE
+            return _MISSING_TABLE
+
+        # Compatibility for custom DB API adapters predating the richer probe:
+        # an empty list historically meant that the filtered request did not
+        # find a reflectable table, so treat it as missing rather than creating
+        # a false columnless Table object.
+        columns = dbapi_connection.flightsql_get_columns(table_name, schema)
+        if columns:
+            return _TableColumnCacheEntry("columns", tuple(columns))
+        return _MISSING_TABLE
+
+    @staticmethod
+    def _columns_from_cache_entry(entry, table_name, schema):
+        qualified_name = table_name if schema is None else f"{schema}.{table_name}"
+        if entry.status == "missing":
+            raise exc.NoSuchTableError(qualified_name)
+        if entry.status == "unreflectable":
+            raise exc.UnreflectableTableError(
+                f"Flight SQL reports table {qualified_name!r}, but filtered GetTables(include_schema=True) "
+                "did not return a parseable Arrow table_schema; check metadata permissions and server support"
+            )
+        return [dict(column) for column in entry.columns]
+
+    def _warn_degraded_reflection(self, schema, *, probes, recovered, unreflectable, stale):
+        warned_schemas = getattr(self, "_degraded_reflection_warned_schemas", None)
+        if warned_schemas is None:
+            warned_schemas = set()
+            self._degraded_reflection_warned_schemas = warned_schemas
+        if schema in warned_schemas:
             return
-        self._degraded_reflection_warning_emitted = True
+        warned_schemas.add(schema)
         scope = "all schemas" if schema is None else f"schema {schema!r}"
         warnings.warn(
-            "Flight SQL GetTables(include_schema=True) returned names but no usable Arrow table_schema metadata "
-            f"for {scope}. Table names and has_table() remain available, but reflected columns may be empty; "
-            "configure or upgrade the server to honor include_schema and return serialized Arrow schemas.",
+            "Flight SQL GetTables(include_schema=True) returned incomplete Arrow table_schema metadata for "
+            f"{scope}; issued {probes} filtered probe(s): {recovered} recovered, {unreflectable} still "
+            f"unreflectable, {stale} stale row(s) excluded. Existing unreflectable names remain visible to "
+            "has_table() but get_columns() fails explicitly. Grant schema-metadata permission or configure/upgrade "
+            "the server to return a serialized Arrow schema for every reported table.",
             exc.SAWarning,
-            stacklevel=3,
+            stacklevel=_reflection_warning_stacklevel(),
         )
 
     @reflection.cache
@@ -246,6 +350,27 @@ class LiteralBindCompiler(compiler.SQLCompiler):
         columns = ", ".join("1" for _ in element_types)
         return f"SELECT {columns} WHERE 1 != 1"
 
+    def _literal_execute_expanding_parameter_literal_binds(
+        self,
+        parameter,
+        values,
+        bind_expression_template=None,
+    ):
+        # SQLAlchemy 1.4.6 asserts that an empty literal-execute expanding
+        # parameter is scalar, even when IN coercion assigned it TupleType.
+        # Render the correctly shaped empty subquery before reaching that old
+        # assertion.  Nonempty values and newer SQLAlchemy behavior continue
+        # through the upstream compiler implementation.
+        if not values and parameter.type._is_tuple_type:
+            return (), self.visit_empty_set_expr(parameter.type.types)
+        if bind_expression_template is None:
+            return super()._literal_execute_expanding_parameter_literal_binds(parameter, values)
+        return super()._literal_execute_expanding_parameter_literal_binds(
+            parameter,
+            values,
+            bind_expression_template=bind_expression_template,
+        )
+
     def visit_bindparam(self, bindparam, within_columns_clause=False, literal_binds=False, **kwargs):
         if literal_binds:
             kwargs["literal_execute"] = False
@@ -270,7 +395,7 @@ class LiteralBindCompiler(compiler.SQLCompiler):
         # fail or can produce a non-SQL value. Compile the SQL NULL expression
         # through SQLAlchemy's visitor contract; never return user text such as
         # the string "NULL" from a type processor.
-        if value is None:
+        if value is None and not type_.should_evaluate_none:
             return self.process(elements.Null._instance())
         return super().render_literal_value(value, type_)
 

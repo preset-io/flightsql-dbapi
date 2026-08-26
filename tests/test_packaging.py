@@ -32,21 +32,21 @@ def test_sqlalchemy_entrypoint_registers_documented_driver_name():
     assert entrypoints["datafusion.flightsql"] == "flightsql.sqlalchemy:DataFusionDialect"
 
 
-def test_provenance_console_entrypoint_is_installed():
+def test_untrusted_installed_provenance_console_entrypoint_is_absent():
     entrypoints = {entrypoint.name: entrypoint.value for entrypoint in distribution("flightsql-dbapi").entry_points}
 
-    assert entrypoints["flightsql-verify-provenance"] == "flightsql.provenance:main"
+    assert "flightsql-verify-provenance" not in entrypoints
 
 
 def test_fork_has_non_pypi_release_identity():
     installed_version = Version(version("flightsql-dbapi"))
 
-    assert installed_version == Version("0.2.3+preset.1")
-    assert installed_version.local == "preset.1"
+    assert installed_version == Version("0.2.3+preset.2")
+    assert installed_version.local == "preset.2"
 
 
 def test_local_version_is_diagnostic_not_a_public_replacement_barrier():
-    fork = Version("0.2.3+preset.1")
+    fork = Version("0.2.3+preset.2")
 
     assert fork > Version("0.2.3")
     assert fork < Version("0.2.4")

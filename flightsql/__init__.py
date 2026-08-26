@@ -13,7 +13,7 @@ from flightsql.exceptions import (
     Warning,
 )
 
-__version__ = "0.2.3+preset.1"
+__version__ = "0.2.3+preset.2"
 
 __all__ = [
     "connect",

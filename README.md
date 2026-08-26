@@ -48,21 +48,33 @@ python -I /trusted/verify-installed-provenance \
 
 Copy `scripts/verify-installed-provenance` from a separately verified checkout
 into `superset-shell`; it does not import or execute the target package. It
-checks installer RECORD hashes, version metadata, and PEP 610 assertions. The
-installed `flightsql-verify-provenance` console command is convenience-only:
-its entry point and implementation live inside the package being checked.
-Neither path is a signature or a defense against an actor able to rewrite the
-installed files, RECORD, and `direct_url.json`, and neither proves which package
-a later manipulated `sys.path` will import. Run the trusted script with `-I` in
-a fresh, access-controlled environment. `--json` reports `commit_verified` and
-the exact scope for automation.
+selects the one `importlib.metadata` distribution, rejects duplicate/decoy
+`.dist-info` directories and unsafe RECORD paths/hashes, and matches RECORD
+SHA-256 for non-bytecode files in the installed `flightsql` package tree and
+the selected distribution-metadata tree, except for RECORD itself. The actual
+selected `direct_url.json` must itself be listed and SHA-256-covered before any
+of its PEP 610 source fields can set `commit_verified: true`. The installed
+console entry point was removed because code supplied by the package under
+inspection is not an independent verifier.
+
+This is a package-provenance consistency check, not a signature or whole
+environment attestation. It excludes `.pyc`, site-level `.pth` files, other
+site-packages, dependencies, interpreter integrity, and later
+`sys.path`/import selection. An actor able to rewrite both files and RECORD can
+forge the check. `-I` usefully ignores user-site and environment path inputs,
+but still runs site processing and cannot detect arbitrary `.pth` or
+site-packages compromise. Use a fresh,
+access-controlled environment. `--json` names the narrow SHA-256 scopes and
+reports whether the hash-covered PEP 610 commit claim matched.
 
 When Git is unavailable, pin the equivalent full-SHA source archive **and its
 SHA-256**, then pass the same digest to the verifier. Local wheel/sdist identity
-mode requires a pip installation and reports `commit_verified: false`; uv local
-artifact metadata is rejected because its PEP 610 shape may omit the digest.
+mode reopens the regular non-symlink file named by the local PEP 610 URL and
+matches its bytes to the externally supplied digest; it does not trust optional
+installer `archive_info` and reports `commit_verified: false`. This verifies the
+referenced file, not a build linkage between that file and the installed tree.
 Do not publish this fork as `flightsql-dbapi` on a public package index. The
-internal fork version is `0.2.3+preset.1`; see
+internal fork version is `0.2.3+preset.2`; see
 [MAINTENANCE.md](MAINTENANCE.md) for the complete threat boundary and matrix.
 
 ## Usage
@@ -126,25 +138,31 @@ print("tables:", [table for table in metadata.sorted_tables])
 When prepared statements are disabled, normal execution uses SQLAlchemy's
 cache-safe post-compile literal rendering. Explicit
 `compile_kwargs={"literal_binds": True}` remains fully literal and produces an
-executable SQL string. Expanding and empty `IN` expressions are covered against
-the bundled SQLite Flight SQL server; that is not a claim that every live
-DataFusion/InfluxDB version accepts every empty-set SQL form, so consumer staging
-must cover queries that depend on it.
+executable SQL string. Scalar and tuple-valued empty expanding binds, including
+reuse of the same compiled statement after nonempty values, are covered at the
+SQLAlchemy 1.4.6 floor and against the bundled SQLite Flight SQL server. That is
+not a claim that every live DataFusion/InfluxDB version accepts every empty-set
+SQL form, so consumer staging must cover queries that depend on it.
 
 Every non-NULL value in literal mode must have a concrete SQLAlchemy type,
 either from a typed column expression or an explicit `bindparam(..., type_=...)`.
 An untyped (`NullType`) non-NULL value fails closed because it cannot be quoted
 unambiguously. `None` is the exception: `String`, `Integer`, and `NullType` binds
 all compile to the SQL expression `NULL` (never the string `'NULL'`) during both
-normal execution and `literal_binds` compilation. SQLAlchemy executemany with
-post-compile literal parameters is not supported; execute individual statements
-or enable the server's prepared-statement feature.
+normal execution and `literal_binds` compilation. Types that explicitly set
+`should_evaluate_none` keep their own literal processor semantics. SQLAlchemy
+executemany with post-compile literal parameters is not supported; execute
+individual statements or enable the server's prepared-statement feature.
 
-If a server ignores `GetTables(include_schema=True)`, the dialect preserves its
-table names and keeps `has_table()` correct, while emitting one actionable
-warning per engine. Column reflection may be empty until that server returns the
-serialized Arrow schemas required by Flight SQL. A genuinely empty catalog is
-returned without that degraded-reflection warning.
+If a bulk `GetTables(include_schema=True)` response reports more names than
+parseable schemas, the dialect issues filtered probes only for those cache
+misses and emits one bounded warning per requested schema. Successfully probed
+columns are cached, confirmed stale names are excluded, and names confirmed to
+exist without schema permission remain visible to `has_table()` while
+`get_columns()` fails explicitly with `UnreflectableTableError`—they are never
+materialized as false columnless tables. A missing table retains
+`NoSuchTableError` semantics. A genuinely empty catalog returns without a
+warning, and transport/reader failures propagate.
 
 ### Custom Dialects
 

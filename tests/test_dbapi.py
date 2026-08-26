@@ -14,7 +14,7 @@ from flightsql.dbapi import (
     dbapi_results,
     resolve_sql_type,
 )
-from flightsql.exceptions import Error, NotSupportedError
+from flightsql.exceptions import DataError, Error, NotSupportedError
 
 
 def test_parameter_record_builder():
@@ -407,7 +407,12 @@ def test_dbapi_results_explicitly_rejects_unsupported_nested_temporal_container(
 
 
 def test_get_columns_returns_empty_result_for_unknown_table():
-    table = pa.table({"table_schema": pa.array([], type=pa.binary())})
+    table = pa.table(
+        {
+            "table_name": pa.array([], type=pa.string()),
+            "table_schema": pa.array([], type=pa.binary()),
+        }
+    )
 
     class Reader:
         def read_all(self):
@@ -433,7 +438,7 @@ def _serialized_schema(schema):
     return sink.getvalue().to_pybytes()
 
 
-def test_get_table_metadata_uses_one_included_schema_request_and_filters_unreflectable_rows():
+def test_get_table_metadata_uses_one_included_schema_request_and_marks_partial_rows():
     table = pa.table(
         {
             "table_name": pa.array(["alpha", "stale", "malformed"]),
@@ -480,12 +485,102 @@ def test_get_table_metadata_uses_one_included_schema_request_and_filters_unrefle
                 }
             ]
         },
-        True,
+        False,
     )
     assert client.calls == [
         ("get_tables", {"db_schema_filter_pattern": "public", "include_schema": True}),
         ("do_get", b"ticket"),
     ]
+
+
+def test_table_metadata_filters_and_keys_same_table_name_by_requested_schema():
+    table = pa.table(
+        {
+            "db_schema_name": ["public", "private"],
+            "table_name": ["records", "records"],
+            "table_schema": pa.array(
+                [
+                    _serialized_schema(pa.schema([pa.field("public_id", pa.int64())])),
+                    _serialized_schema(pa.schema([pa.field("private_id", pa.string())])),
+                ],
+                type=pa.binary(),
+            ),
+        }
+    )
+
+    class Reader:
+        def read_all(self):
+            return table
+
+    class Client:
+        def get_tables(self, **kwargs):
+            return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
+
+        def do_get(self, ticket):
+            return Reader()
+
+    connection = Connection(Client())
+
+    public = connection.flightsql_get_table_metadata("public")
+    private = connection.flightsql_get_table_metadata("private")
+    ambiguous = connection.flightsql_get_table_metadata(None)
+
+    assert [column["name"] for column in public.columns_by_name["records"]] == ["public_id"]
+    assert [column["name"] for column in private.columns_by_name["records"]] == ["private_id"]
+    assert ambiguous == TableMetadataResult(["records"], {}, False)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        pa.table({"table_schema": pa.array([], type=pa.binary())}),
+        pa.table({"table_schema": [b"bad"]}),
+    ],
+    ids=["empty", "populated"],
+)
+def test_table_metadata_rejects_missing_table_name_column_explicitly(table):
+    class Reader:
+        def read_all(self):
+            return table
+
+    class Client:
+        def get_tables(self, **kwargs):
+            return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
+
+        def do_get(self, ticket):
+            return Reader()
+
+    with pytest.raises(DataError, match="missing required table_name column"):
+        Connection(Client()).flightsql_get_table_metadata()
+
+
+@pytest.mark.parametrize(
+    ("info", "reader", "message"),
+    [
+        (object(), None, "no iterable endpoints"),
+        (SimpleNamespace(endpoints=[object()]), None, "missing its ticket"),
+        (
+            SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")]),
+            object(),
+            r"no read_all\(\) method",
+        ),
+        (
+            SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")]),
+            SimpleNamespace(read_all=lambda: {"not": "arrow"}),
+            "non-Table payload",
+        ),
+    ],
+)
+def test_table_metadata_rejects_malformed_response_shapes_explicitly(info, reader, message):
+    class Client:
+        def get_tables(self, **kwargs):
+            return info
+
+        def do_get(self, ticket):
+            return reader
+
+    with pytest.raises(DataError, match=message):
+        Connection(Client()).flightsql_get_table_metadata()
 
 
 def test_get_table_metadata_distinguishes_names_only_response_from_empty_catalog():

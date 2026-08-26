@@ -21,38 +21,44 @@ flightsql-dbapi @ git+https://github.com/preset-io/flightsql-dbapi.git@<full-com
 Add the same line to the consumer constraints file and use that constraint for
 every pip install/upgrade in the image build. A requirement in only one layer is
 not a source guarantee. After installation, copy the self-contained verifier
-from a separately verified checkout and invoke it in isolated mode:
+from a separately verified checkout and invoke it with narrowed path inputs:
 
 ```console
 python -I /trusted/verify-installed-provenance \
   --expected-commit <full-commit-sha> \
-  --expected-version 0.2.3+preset.1
+  --expected-version 0.2.3+preset.2
 ```
 
 This rejects the public 0.2.2 build, any other version, index installs without
 PEP 610 provenance, a different repository, a branch/tag request, and a commit
 other than the asserted full SHA when the recorded source mode is Git/archive.
-It also hashes installer-recorded files without importing `flightsql`. The
-installed console command `flightsql-verify-provenance` is only a convenience
-smoke check because the package being inspected supplies that command and its
-Python implementation. Use `--json` when automation needs the explicit
-`commit_verified` result.
+It also matches RECORD SHA-256 for non-bytecode files in the selected package
+and actual `.dist-info` trees (except RECORD itself) without importing
+`flightsql`; `direct_url.json` must be among those hash-covered files before a
+source claim is accepted. There is no installed console entry point because the
+package being inspected cannot supply an independent verifier. Use `--json`
+for the explicitly named package and metadata scopes. `commit_verified` is a
+match against hash-covered PEP 610
+metadata, not an environment or runtime-import attestation. `-I` does not detect
+malicious `.pth`, bytecode, other site-packages, or interpreter compromise.
 
 For an uncommitted local candidate, create `requirements-local.txt` in the
 Superset Docker directory and serve a freshly built source distribution. For
 example:
 
 ```
-flightsql-dbapi @ http://docker.for.mac.host.internal:8000/dist/flightsql_dbapi-0.2.3+preset.1.tar.gz
+flightsql-dbapi @ http://docker.for.mac.host.internal:8000/dist/flightsql_dbapi-0.2.3+preset.2.tar.gz
 ```
 
-Install local wheels/sdists with `python -m pip`; uv local artifact mode is
-rejected because its `direct_url.json` may not record the artifact digest. Local
-artifacts do not encode their source commit. For a controlled test, record the
-artifact SHA-256 before installation and invoke the verifier with both
+Local artifacts do not encode their source commit. For a controlled test, retain
+the artifact at its PEP 610 file URL, record its SHA-256 before installation,
+and invoke the verifier with both
 `--expected-artifact-sha256 <digest>` and `--allow-local-artifact`; this mode
-checks artifact identity and deliberately reports that it did **not** verify the
-supplied commit. The build system must separately attest the source commit.
+reopens that non-symlink wheel/sdist and hashes its bytes without relying on pip
+or uv's optional `archive_info`, and deliberately reports that it did **not**
+verify the supplied commit. It does not prove that the installed tree was built
+from that file. The build system must separately attest the source commit and
+retain the original artifact/digest evidence.
 Production source-archive installs use a full-SHA GitHub URL plus
 `#sha256=<digest>` and do not use the local-artifact escape hatch.
 

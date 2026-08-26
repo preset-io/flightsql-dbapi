@@ -17,13 +17,20 @@ Superset distribution indefinitely.
   claimed here. On 2026-08-26 the authenticated API exposed real Preset teams,
   but the repository-team endpoint returned 404 and team/repository permission
   checks required unavailable organization-admin scope. A repository admin
-  should recheck before the consumer pin. Until a write-capable multi-member
-  team is actually verified, CI enforces a nonempty CODEOWNERS file plus these
-  structured maintenance fields without inferring access from a team name.
-- **Review gate:** the coordinator manages each `superset-shell` pin and must obtain
-  review from a `superset-shell` dependency owner. TLS/auth changes additionally
-  require a Preset security reviewer. No rewritten compatibility series should
-  open a PR until a different engineer has independently approved it.
+  must recheck before the consumer pin. Repository lint validates only the
+  syntax and presence of CODEOWNERS and these fields; it cannot infer access,
+  assignment, or enforcement from a user/team name.
+- **External administrator gates:** branch protection, CODEOWNERS enforcement,
+  required human review approvals, and required status checks are GitHub settings
+  that only a repository administrator can configure and verify. Repository
+  files and green local/CI commands do not prove those gates are active.
+- **Review policy:** the coordinator manages each `superset-shell` pin and must
+  obtain human review from a `superset-shell` dependency owner. TLS/auth changes
+  additionally require a Preset security reviewer. Automated review, including
+  an exact-SHA independent review, is diagnostic evidence and is not human
+  approval. Do not open a PR for this compatibility series until the requested
+  next exact-SHA independent review completes; do not merge or move the consumer
+  pin without the external human/admin gates above.
 
 ## Supported matrix
 
@@ -48,13 +55,15 @@ needs it.
 The SQLAlchemy 1.4 floor is deliberately 1.4.6. On 1.4.0, execution-time
 literal rendering of one named bind used in multiple SQL positions raises a
 post-compile `KeyError`; 1.4.6 handles every occurrence and is covered by the
-repeated-bind cache regression. The dialect does not claim compatibility with
-1.4.0–1.4.5.
+repeated-bind cache regression. The fork additionally bypasses a 1.4.6 compiler
+assertion for empty tuple-valued expanding binds and covers empty/nonempty cache
+reuse. The dialect does not claim compatibility with 1.4.0–1.4.5.
 
 The non-prepared compiler requires a concrete SQLAlchemy type for every
 non-NULL literal value; untyped non-NULL binds are rejected. A `None` value is
 handled separately by the compiler and emitted as SQL `NULL` for String,
-Integer, and NullType binds on both declared SQLAlchemy floors. SQLAlchemy
+Integer, and NullType binds on both declared SQLAlchemy floors. A type that opts
+into `should_evaluate_none` retains its own literal processor. SQLAlchemy
 executemany is not available for these post-compile literal parameters, and the
 DB API's direct `executemany()` implementation sends one prepared RPC per row
 rather than a true bulk parameter batch.
@@ -67,10 +76,15 @@ Changes in those areas require bounded unit coverage here and a staging smoke
 test by the consuming service before its pin moves.
 
 Reflection treats a successful zero-row GetTables result as an empty catalog.
-If a nonempty result ignores `include_schema`, names and `has_table()` remain
-available and one warning per dialect explains that columns may be unavailable.
-Malformed included schemas are isolated to their rows; GetTables, DoGet, and
-reader transport failures are never converted into an empty catalog.
+If reported names exceed parseable included schemas, only the missing table keys
+receive filtered live probes. The cache key includes schema and table name, so
+same-named tables cannot cross-contaminate schemas. Confirmed stale rows are
+excluded; confirmed existing but permission-scoped/unparseable tables remain
+visible to `has_table()` and raise `UnreflectableTableError` for columns instead
+of becoming columnless tables. A warning is bounded to once per requested
+schema and reports probe/recovery/stale counts. Missing `table_name` columns and
+malformed metadata shapes raise `DataError`; GetTables, DoGet, reader, and probe
+transport failures retain their original exceptions.
 
 DB API nanosecond temporal normalization supports timestamp, time64, and
 duration values recursively through list, large-list, fixed-size-list, struct,
@@ -97,7 +111,8 @@ remains the release channel:
 
 1. Merge a reviewed, green commit in this repository.
 2. Record the internal fork version in `pyproject.toml` and
-   `flightsql/__init__.py` (currently `0.2.3+preset.1`).
+   `flightsql/__init__.py` (currently `0.2.3+preset.2`; `preset.1` candidate
+   artifacts already exist and must not be reused).
 3. Run the installed-wheel matrix and the reference-server suite.
 4. Pin the consumer to the immutable 40-character commit SHA. A source archive
    generated from that same SHA and pinned by SHA-256 is acceptable where Git
@@ -107,29 +122,42 @@ remains the release channel:
 The consumer must repeat the direct reference in a constraints file and pass it
 to every resolver invocation. After installation, copy the self-contained
 `scripts/verify-installed-provenance` from a separately verified checkout and
-run it with `python -I` as the primary consumer path. It does not import the
-target package: it checks the exact PEP 440-normalized internal version,
-installer RECORD hashes, and PEP 610 Git/archive assertions. An archive
-additionally requires its externally recorded SHA-256. `--json` exposes the
-verified scope without relying on prose.
+run it with `python -I` as a path-narrowing consumer practice. It does not import
+the target package. It derives the selected `.dist-info` directory from the
+`importlib.metadata` distribution path rather than RECORD, rejects
+duplicate/decoy metadata directories and unsafe RECORD path/hash forms, and
+matches RECORD SHA-256 for every non-bytecode regular file in the selected
+`flightsql` package and distribution-metadata trees except RECORD itself. The
+actual selected `direct_url.json` must be present and SHA-256-covered before its
+PEP 610 Git/archive fields are parsed. An archive additionally requires its
+externally recorded SHA-256. `--json` uses the explicit fields
+`package_source_record_sha256_verified`,
+`distribution_metadata_record_sha256_verified`, and
+`direct_url_record_sha256_verified`; `commit_verified` means only that those
+hash-checked recorded source fields match the asserted SHA/repository.
 
-The installed `flightsql-verify-provenance` console script is convenience-only,
-because its entry point and implementation are package files under inspection.
-RECORD checking detects missing, injected, partially changed, or inconsistent
-installed files, but RECORD and PEP 610 metadata are not signed. An actor able to
-write site-packages can rewrite code, RECORD, `INSTALLER`, and `direct_url.json`
-together; a manipulated runtime `sys.path` can also import a different package
-after verification. The trusted boundary therefore includes the standalone
-script, Python interpreter, `packaging` dependency, externally stored expected
-SHA/digest, resolver inputs, and filesystem access controls. Run in a fresh
-environment and do not describe this consistency assertion as general
-replacement or compromise detection.
+There is deliberately no installed provenance console entry point: its launcher
+and implementation would be supplied by the package under inspection. The
+standalone check is still not an authenticity proof. RECORD and PEP 610 are not
+signed, so an actor able to rewrite files and RECORD together can forge it. The
+scope expressly excludes `.pyc`, site-level `.pth` files, arbitrary
+site-packages, dependencies, the Python interpreter, runtime import selection,
+and the rest of the environment. `-I` ignores user-site and environment path
+inputs but still runs site processing; it neither blocks malicious `.pth` files
+in the active environment nor attests site-packages. The trusted boundary
+therefore includes
+the standalone script, interpreter, `packaging` dependency, externally stored
+SHA/digest, resolver inputs, and filesystem access controls. Run in a fresh,
+access-controlled environment and never describe the result as environment,
+replacement, or compromise detection.
 
-A local wheel/sdist is accepted only in explicit artifact-test mode after pip
-installation with an externally recorded digest. uv is rejected causally
-because its local-artifact `direct_url.json` shapes may omit that digest. The
-result verifies artifact identity and sets `commit_verified` to false: the
-supplied expected commit is context, not evidence of what built the artifact.
+A local wheel/sdist is accepted only in explicit artifact-test mode with an
+externally recorded digest and the original file still available at its PEP 610
+URL. The verifier reopens that regular non-symlink file and matches its bytes;
+it does not rely on pip/uv's optional `archive_info`. The result uses
+`local_artifact_file_sha256_verified` and sets `commit_verified` to false. This
+does not prove the installed tree was built from that artifact, and the supplied
+expected commit remains context rather than build evidence.
 
 The distribution name remains `flightsql-dbapi` because Superset requirements,
 the `flightsql` import package, and SQLAlchemy entry-point metadata already use
@@ -139,7 +167,7 @@ artifact registry rather than source pins, it must first choose a distinct
 distribution name (for example, `preset-flightsql-dbapi`) and complete an
 explicit packaging, migration, security, and ownership review.
 
-`0.2.3+preset.1` does **not** create a globally unique distribution identity.
+`0.2.3+preset.2` does **not** create a globally unique distribution identity.
 Under PEP 440 it sorts after public `0.2.3` but before public `0.2.4`, and a
 specifier such as `==0.2.3` also admits the local version. A resolver or later
 unconstrained upgrade can therefore select a public build. The local suffix is

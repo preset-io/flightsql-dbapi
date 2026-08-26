@@ -14,11 +14,18 @@ paramstyle = "qmark"
 apilevel = "2.0"
 
 ExecuteParams = Union[Tuple[Any, ...], List[Any]]
+TableMetadataRow = Tuple[str, Optional[str], Any, bool]
 
 
 @dataclass(frozen=True)
 class TableMetadataResult:
-    """Names and optional Arrow schemas returned by one GetTables request."""
+    """Names and any usable Arrow schemas returned by GetTables.
+
+    ``included_schema_supported`` is true only when every reported name has a
+    parseable, unambiguous schema.  A false value may still carry the schemas
+    that were usable, allowing the SQLAlchemy dialect to live-probe only the
+    cache misses rather than repeating work for every table.
+    """
 
     table_names: List[str]
     columns_by_name: Optional[Dict[str, List[Dict]]]
@@ -174,13 +181,41 @@ class Connection:
     @check_closed
     def flightsql_get_columns(self, table_name: str, schema: Optional[str] = None) -> List[Dict]:
         """Get the columns of a table using Flight SQL."""
-        info = self.client.get_tables(
-            table_name_filter_pattern=table_name, db_schema_filter_pattern=schema, include_schema=True
-        )
-        metadata = self._table_metadata_from_info(info).columns_by_name
+        result = self.flightsql_get_table_metadata_for_table(table_name, schema)
+        metadata = result.columns_by_name
         if metadata is None:
             return []
         return metadata.get(table_name, [])
+
+    @check_closed
+    def flightsql_get_table_metadata_for_table(
+        self, table_name: str, schema: Optional[str] = None
+    ) -> TableMetadataResult:
+        """Probe one exact table while preserving found/unreflectable state.
+
+        A filtered included-schema response normally costs one GetTables RPC.
+        If that response is empty, a names-only request distinguishes a stale
+        bulk row from a server that returns zero rows whenever include_schema
+        is requested.  Transport and reader failures deliberately propagate.
+        """
+        info = self.client.get_tables(
+            table_name_filter_pattern=table_name,
+            db_schema_filter_pattern=schema,
+            include_schema=True,
+        )
+        result = self._table_metadata_from_info(info, requested_schema=schema)
+        if result.table_names:
+            return result
+
+        names_info = self.client.get_tables(
+            table_name_filter_pattern=table_name,
+            db_schema_filter_pattern=schema,
+        )
+        names = self._table_metadata_from_info(names_info, requested_schema=schema).table_names
+        exact_names = [name for name in names if name == table_name]
+        if exact_names:
+            return TableMetadataResult(exact_names, None, False)
+        return result
 
     @check_closed
     def flightsql_get_table_metadata(self, schema: Optional[str] = None) -> TableMetadataResult:
@@ -191,7 +226,7 @@ class Connection:
         result. Flight transport errors deliberately propagate.
         """
         info = self.client.get_tables(db_schema_filter_pattern=schema, include_schema=True)
-        result = self._table_metadata_from_info(info)
+        result = self._table_metadata_from_info(info, requested_schema=schema)
         if not result.table_names and result.columns_by_name == {}:
             # Some servers answer the unsupported include_schema variant with
             # zero rows. A names-only request is the only way to distinguish
@@ -205,11 +240,7 @@ class Connection:
     def flightsql_get_table_names(self, schema: Optional[str] = None) -> List[str]:
         """Get the names of all tables within the schema."""
         info = self.client.get_tables(db_schema_filter_pattern=schema)
-        names: List[str] = []
-        for table in self._tables_from_info(info):
-            if "table_name" in table.column_names:
-                names.extend(table.column("table_name").to_pylist())
-        return names
+        return self._table_metadata_from_info(info, requested_schema=schema).table_names
 
     @check_closed
     def flightsql_get_schema_names(self) -> List[str]:
@@ -244,46 +275,120 @@ class Connection:
         return reader.read_all().to_pylist()
 
     def _tables_from_info(self, info: Any) -> List[pa.Table]:
-        return [self.client.do_get(endpoint.ticket).read_all() for endpoint in info.endpoints]
+        try:
+            endpoints = list(info.endpoints)
+        except (AttributeError, TypeError) as error:
+            raise DataError("Flight SQL metadata response has no iterable endpoints") from error
 
-    def _table_metadata_from_info(self, info: Any) -> TableMetadataResult:
+        tables: List[pa.Table] = []
+        for endpoint in endpoints:
+            if not hasattr(endpoint, "ticket"):
+                raise DataError("Flight SQL metadata endpoint is missing its ticket")
+            # Calls that can perform transport IO remain outside parsing error
+            # handlers so authorization, network, and reader failures retain
+            # their original exception and causal traceback.
+            reader = self.client.do_get(endpoint.ticket)
+            read_all = getattr(reader, "read_all", None)
+            if not callable(read_all):
+                raise DataError("Flight SQL metadata reader has no read_all() method")
+            table = read_all()
+            if not isinstance(table, pa.Table):
+                raise DataError("Flight SQL metadata reader returned a non-Table payload")
+            tables.append(table)
+        return tables
+
+    def _table_metadata_from_info(
+        self,
+        info: Any,
+        requested_schema: Optional[str] = None,
+    ) -> TableMetadataResult:
         tables = self._tables_from_info(info)
         if not tables:
             return TableMetadataResult([], {}, True)
-        if sum(table.num_rows for table in tables) == 0:
+
+        rows, saw_table_schema = self._table_metadata_rows(tables, requested_schema)
+        if not rows:
             return TableMetadataResult([], {}, True)
 
-        table_names: List[str] = []
-        for table in tables:
-            if "table_name" in table.column_names:
-                table_names.extend(name for name in table.column("table_name").to_pylist() if isinstance(name, str))
-        # Keep stable server order while protecting has_table() and reflection
-        # caches from duplicate endpoints/rows.
-        table_names = list(dict.fromkeys(table_names))
-
-        if any(table.num_rows and "table_schema" not in table.column_names for table in tables):
+        table_names = list(dict.fromkeys(name for name, _schema, _serialized, _present in rows))
+        metadata = self._parse_table_schema_rows(rows, requested_schema)
+        if len(metadata) == len(table_names):
+            return TableMetadataResult(table_names, metadata, True)
+        if not saw_table_schema:
             return TableMetadataResult(table_names, None, False)
+        return TableMetadataResult(table_names, metadata, False)
 
-        metadata: Dict[str, List[Dict]] = {}
+    @staticmethod
+    def _table_metadata_rows(
+        tables: List[pa.Table], requested_schema: Optional[str]
+    ) -> Tuple[List[TableMetadataRow], bool]:
+        # Retain row qualification while parsing.  GetTables filters are
+        # patterns, and some servers return rows from more than one schema;
+        # projecting to a bare table name before filtering can otherwise cache
+        # one schema's columns under another schema's SQLAlchemy cache key.
+        rows: List[TableMetadataRow] = []
+        saw_table_schema = False
         for table in tables:
-            if table.num_rows == 0:
-                continue
+            if "table_name" not in table.column_names:
+                raise DataError("Flight SQL GetTables payload is missing required table_name column")
+
             names = table.column("table_name").to_pylist()
-            schemas = table.column("table_schema").to_pylist()
-            for name, serialized_schema in zip(names, schemas):
-                if not isinstance(name, str) or serialized_schema is None:
+            if "db_schema_name" in table.column_names:
+                schema_names = table.column("db_schema_name").to_pylist()
+            else:
+                schema_names = [None] * table.num_rows
+            has_table_schema = "table_schema" in table.column_names
+            saw_table_schema = saw_table_schema or has_table_schema
+            serialized_schemas = (
+                table.column("table_schema").to_pylist() if has_table_schema else [None] * table.num_rows
+            )
+
+            for name, row_schema, serialized_schema in zip(names, schema_names, serialized_schemas):
+                if not isinstance(name, str) or not name:
+                    raise DataError("Flight SQL GetTables table_name values must be nonempty strings")
+                if row_schema is not None and not isinstance(row_schema, str):
+                    raise DataError("Flight SQL GetTables db_schema_name values must be strings or null")
+                if requested_schema is not None and row_schema not in (None, requested_schema):
                     continue
-                try:
-                    schema = ipc.open_stream(serialized_schema).schema
-                except (OSError, pa.ArrowInvalid, pa.ArrowTypeError):
-                    # The metadata row itself is stale or malformed. Only
-                    # parsing happens inside this catch; get_tables/do_get and
-                    # read_all transport failures continue to propagate.
-                    continue
-                metadata[name] = column_specs(schema)
-        if table_names and not metadata:
-            return TableMetadataResult(table_names, None, False)
-        return TableMetadataResult(table_names, metadata, True)
+                rows.append((name, row_schema, serialized_schema, has_table_schema))
+        return rows, saw_table_schema
+
+    @staticmethod
+    def _parse_table_schema_rows(
+        rows: List[TableMetadataRow], requested_schema: Optional[str]
+    ) -> Dict[str, List[Dict]]:
+        schemas_by_name: Dict[str, set[Optional[str]]] = {}
+        for name, row_schema, _serialized, _present in rows:
+            schemas_by_name.setdefault(name, set()).add(row_schema)
+        ambiguous_names = {
+            name
+            for name, reported_schemas in schemas_by_name.items()
+            if requested_schema is None and len(reported_schemas) > 1
+        }
+
+        parsed_by_name: Dict[str, List[Dict]] = {}
+        invalid_names = set(ambiguous_names)
+        for name, _row_schema, serialized_schema, has_table_schema in rows:
+            if name in invalid_names or not has_table_schema or serialized_schema is None:
+                invalid_names.add(name)
+                parsed_by_name.pop(name, None)
+                continue
+            if not isinstance(serialized_schema, (bytes, bytearray, memoryview, pa.Buffer)):
+                invalid_names.add(name)
+                parsed_by_name.pop(name, None)
+                continue
+            try:
+                schema = ipc.open_stream(serialized_schema).schema
+            except (OSError, TypeError, ValueError, pa.ArrowInvalid, pa.ArrowTypeError):
+                # Only local IPC decoding is downgraded to a cache miss.  The
+                # filtered live probe can distinguish a stale row from an
+                # existing table whose schema is permission-scoped/corrupt.
+                invalid_names.add(name)
+                parsed_by_name.pop(name, None)
+                continue
+            if name not in invalid_names:
+                parsed_by_name[name] = column_specs(schema)
+        return {name: columns for name, columns in parsed_by_name.items() if name not in invalid_names}
 
     @property
     def features(self) -> Dict[str, str]:

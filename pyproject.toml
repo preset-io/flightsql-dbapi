@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flightsql-dbapi"
-version = "0.2.3+preset.1"
+version = "0.2.3+preset.2"
 authors = [
   { name="Brett Buddin", email="brett@buddin.org" },
 ]
@@ -58,9 +58,6 @@ dev = [
 [project.entry-points."sqlalchemy.dialects"]
 datafusion = "flightsql.sqlalchemy:DataFusionDialect"
 "datafusion.flightsql" = "flightsql.sqlalchemy:DataFusionDialect"
-
-[project.scripts]
-flightsql-verify-provenance = "flightsql.provenance:main"
 
 [tool.hatch.build.targets.wheel.force-include]
 "flightsql/flightsql_pb2.pyi" = "flightsql/flightsql_pb2.pyi"

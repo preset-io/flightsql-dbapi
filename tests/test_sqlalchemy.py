@@ -1,12 +1,29 @@
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import Integer, String, bindparam, column, create_engine, select, table
+from sqlalchemy import (
+    Integer,
+    String,
+    bindparam,
+    column,
+    create_engine,
+    select,
+    table,
+    tuple_,
+)
 from sqlalchemy.dialects import registry
 from sqlalchemy.engine import URL
-from sqlalchemy.exc import ArgumentError, SADeprecationWarning, SAWarning
+from sqlalchemy.exc import (
+    ArgumentError,
+    NoSuchTableError,
+    SADeprecationWarning,
+    SAWarning,
+    UnreflectableTableError,
+)
 from sqlalchemy.sql.sqltypes import NullType
+from sqlalchemy.types import TypeDecorator
 
 import flightsql
 from flightsql.dbapi import TableMetadataResult
@@ -367,51 +384,7 @@ def test_reflection_uses_bulk_included_schemas_and_shared_info_cache_without_n_p
     assert connection.connection.calls == [("metadata", "public")]
 
 
-def test_reflection_names_only_fallback_preserves_names_has_table_cache_and_warns_once():
-    class NamesOnlyDBAPIConnection:
-        features = {}
-
-        def __init__(self):
-            self.calls = []
-
-        def flightsql_get_table_metadata(self, schema):
-            self.calls.append(("metadata", schema))
-            return TableMetadataResult(["alpha", "schema_blackout"], None, False)
-
-        def flightsql_get_table_names(self, schema):
-            raise AssertionError("the included-schema response already preserved the table names")
-
-        def flightsql_get_columns(self, table_name, schema):
-            self.calls.append(("columns", table_name, schema))
-            return []
-
-    connection = SimpleNamespace(connection=NamesOnlyDBAPIConnection())
-    dialect = FlightSQLDialect()
-    info_cache = {}
-
-    with pytest.warns(SAWarning, match=r"names but no usable Arrow table_schema metadata") as captured:
-        assert dialect.get_table_names(connection, schema="public", info_cache=info_cache) == [
-            "alpha",
-            "schema_blackout",
-        ]
-        assert dialect.has_table(connection, "schema_blackout", schema="public", info_cache=info_cache)
-        assert not dialect.has_table(connection, "missing", schema="public", info_cache=info_cache)
-        # A distinct cache forces a second RPC, but warning emission remains
-        # bounded to one per dialect/engine.
-        assert dialect.get_table_names(connection, schema="other", info_cache={}) == ["alpha", "schema_blackout"]
-
-    assert len(captured) == 1
-    assert connection.connection.calls == [
-        ("metadata", "public"),
-        ("columns", "alpha", "public"),
-        ("columns", "schema_blackout", "public"),
-        ("metadata", "other"),
-        ("columns", "alpha", "other"),
-        ("columns", "schema_blackout", "other"),
-    ]
-
-
-def test_reflection_names_only_fallback_filters_stale_rows_when_per_table_schemas_work_and_caches_columns():
+def test_partial_reflection_live_probes_only_corrupt_cache_miss_and_recovers_columns():
     class PartialDBAPIConnection:
         features = {}
 
@@ -420,28 +393,191 @@ def test_reflection_names_only_fallback_filters_stale_rows_when_per_table_schema
 
         def flightsql_get_table_metadata(self, schema):
             self.calls.append(("metadata", schema))
-            return TableMetadataResult(["alpha", "stale"], None, False)
+            return TableMetadataResult(
+                ["good", "corrupt"],
+                {"good": [{"name": "bulk_id"}]},
+                False,
+            )
 
-        def flightsql_get_columns(self, table_name, schema):
-            self.calls.append(("columns", table_name, schema))
-            if table_name == "stale":
-                return []
-            return [{"name": "id", "table": table_name}]
+        def flightsql_get_table_metadata_for_table(self, table_name, schema):
+            self.calls.append(("probe", table_name, schema))
+            assert table_name == "corrupt"
+            return TableMetadataResult(
+                ["corrupt"],
+                {"corrupt": [{"name": "live_id"}]},
+                True,
+            )
 
     connection = SimpleNamespace(connection=PartialDBAPIConnection())
     dialect = FlightSQLDialect()
     info_cache = {}
 
-    with pytest.warns(SAWarning, match="reflected columns may be empty"):
-        assert dialect.get_table_names(connection, schema="public", info_cache=info_cache) == ["alpha"]
-    assert dialect.get_columns(connection, "alpha", schema="public", info_cache=info_cache) == [
-        {"name": "id", "table": "alpha"}
-    ]
+    with pytest.warns(SAWarning, match=r"issued 1 filtered probe\(s\): 1 recovered") as captured:
+        assert dialect.get_table_names(connection, schema="public", info_cache=info_cache) == ["good", "corrupt"]
+    assert Path(captured[0].filename) == Path(__file__)
+    assert dialect.get_columns(connection, "good", schema="public", info_cache=info_cache) == [{"name": "bulk_id"}]
+    assert dialect.get_columns(connection, "corrupt", schema="public", info_cache=info_cache) == [{"name": "live_id"}]
+    assert dialect.has_table(connection, "corrupt", schema="public", info_cache=info_cache)
     assert connection.connection.calls == [
         ("metadata", "public"),
-        ("columns", "alpha", "public"),
-        ("columns", "stale", "public"),
+        ("probe", "corrupt", "public"),
     ]
+
+
+def test_permission_scoped_reflection_preserves_name_but_fails_columns_explicitly():
+    class PermissionScopedDBAPIConnection:
+        features = {}
+
+        def __init__(self):
+            self.calls = []
+
+        def flightsql_get_table_metadata(self, schema):
+            self.calls.append(("metadata", schema))
+            return TableMetadataResult(["visible_without_columns"], None, False)
+
+        def flightsql_get_table_metadata_for_table(self, table_name, schema):
+            self.calls.append(("probe", table_name, schema))
+            return TableMetadataResult([table_name], None, False)
+
+    connection = SimpleNamespace(connection=PermissionScopedDBAPIConnection())
+    dialect = FlightSQLDialect()
+    info_cache = {}
+
+    with pytest.warns(SAWarning, match="1 still unreflectable"):
+        assert dialect.get_table_names(connection, schema="restricted", info_cache=info_cache) == [
+            "visible_without_columns"
+        ]
+    assert dialect.has_table(
+        connection,
+        "visible_without_columns",
+        schema="restricted",
+        info_cache=info_cache,
+    )
+    with pytest.raises(UnreflectableTableError, match="metadata permissions"):
+        dialect.get_columns(
+            connection,
+            "visible_without_columns",
+            schema="restricted",
+            info_cache=info_cache,
+        )
+    assert connection.connection.calls == [
+        ("metadata", "restricted"),
+        ("probe", "visible_without_columns", "restricted"),
+    ]
+
+
+def test_partial_reflection_excludes_confirmed_stale_row_and_preserves_no_such_table_semantics():
+    class StaleDBAPIConnection:
+        features = {}
+
+        def __init__(self):
+            self.calls = []
+
+        def flightsql_get_table_metadata(self, schema):
+            self.calls.append(("metadata", schema))
+            return TableMetadataResult(
+                ["good", "stale"],
+                {"good": [{"name": "id"}]},
+                False,
+            )
+
+        def flightsql_get_table_metadata_for_table(self, table_name, schema):
+            self.calls.append(("probe", table_name, schema))
+            return TableMetadataResult([], {}, True)
+
+    connection = SimpleNamespace(connection=StaleDBAPIConnection())
+    dialect = FlightSQLDialect()
+    info_cache = {}
+
+    with pytest.warns(SAWarning, match=r"1 stale row\(s\) excluded"):
+        assert dialect.get_table_names(connection, schema="public", info_cache=info_cache) == ["good"]
+    assert not dialect.has_table(connection, "stale", schema="public", info_cache=info_cache)
+    with pytest.raises(NoSuchTableError, match=r"public\.stale"):
+        dialect.get_columns(connection, "stale", schema="public", info_cache=info_cache)
+    assert connection.connection.calls == [
+        ("metadata", "public"),
+        ("probe", "stale", "public"),
+    ]
+
+
+def test_partial_reflection_probe_transport_failure_propagates_after_partial_success():
+    class PartiallyFailingDBAPIConnection:
+        features = {}
+
+        def __init__(self):
+            self.calls = []
+
+        def flightsql_get_table_metadata(self, schema):
+            self.calls.append(("metadata", schema))
+            return TableMetadataResult(["first", "second"], None, False)
+
+        def flightsql_get_table_metadata_for_table(self, table_name, schema):
+            self.calls.append(("probe", table_name, schema))
+            if table_name == "second":
+                raise RuntimeError("filtered transport unavailable")
+            return TableMetadataResult([table_name], {table_name: [{"name": "id"}]}, True)
+
+    connection = SimpleNamespace(connection=PartiallyFailingDBAPIConnection())
+
+    with pytest.raises(RuntimeError, match="filtered transport unavailable"):
+        FlightSQLDialect().get_table_names(connection, schema="public", info_cache={})
+    assert connection.connection.calls == [
+        ("metadata", "public"),
+        ("probe", "first", "public"),
+        ("probe", "second", "public"),
+    ]
+
+
+def test_reflection_cache_keys_columns_by_schema_for_same_table_name():
+    class MultiSchemaDBAPIConnection:
+        features = {}
+
+        def __init__(self):
+            self.calls = []
+
+        def flightsql_get_table_metadata(self, schema):
+            self.calls.append(("metadata", schema))
+            return TableMetadataResult(
+                ["records"],
+                {"records": [{"name": f"{schema}_id"}]},
+                True,
+            )
+
+    connection = SimpleNamespace(connection=MultiSchemaDBAPIConnection())
+    dialect = FlightSQLDialect()
+    info_cache = {}
+
+    assert dialect.get_table_names(connection, schema="public", info_cache=info_cache) == ["records"]
+    assert dialect.get_table_names(connection, schema="private", info_cache=info_cache) == ["records"]
+    assert dialect.get_columns(connection, "records", schema="public", info_cache=info_cache) == [{"name": "public_id"}]
+    assert dialect.get_columns(connection, "records", schema="private", info_cache=info_cache) == [
+        {"name": "private_id"}
+    ]
+    assert connection.connection.calls == [("metadata", "public"), ("metadata", "private")]
+
+
+def test_degraded_reflection_warning_is_latched_per_schema():
+    class StaleDBAPIConnection:
+        features = {}
+
+        def flightsql_get_table_metadata(self, schema):
+            return TableMetadataResult(["stale"], None, False)
+
+        def flightsql_get_table_metadata_for_table(self, table_name, schema):
+            return TableMetadataResult([], {}, True)
+
+    connection = SimpleNamespace(connection=StaleDBAPIConnection())
+    dialect = FlightSQLDialect()
+
+    with pytest.warns(SAWarning) as captured:
+        dialect.get_table_names(connection, schema="one", info_cache={})
+        dialect.get_table_names(connection, schema="one", info_cache={})
+        dialect.get_table_names(connection, schema="two", info_cache={})
+
+    assert len(captured) == 2
+    assert all(Path(item.filename) == Path(__file__) for item in captured)
+    assert "schema 'one'" in str(captured[0].message)
+    assert "schema 'two'" in str(captured[1].message)
 
 
 def test_reflection_empty_catalog_is_not_treated_as_unsupported_schema_metadata():
@@ -512,6 +648,40 @@ def test_normal_compilation_uses_postcompile_tokens_and_stable_cache_keys():
     assert DataFusionDialect.supports_statement_cache is True
 
 
+def test_empty_scalar_and_tuple_expanding_binds_render_at_1_4_6_floor_and_reuse_compiled_state():
+    records = table("records", column("id", Integer), column("label", String))
+    ids = bindparam("ids", expanding=True)
+    pairs = bindparam("pairs", expanding=True)
+    scalar_statement = select(records.c.id).where(records.c.id.in_(ids))
+    tuple_statement = select(records.c.id).where(tuple_(records.c.id, records.c.label).in_(pairs))
+
+    scalar_compiled = scalar_statement.compile(dialect=_literal_dialect())
+    tuple_compiled = tuple_statement.compile(dialect=_literal_dialect())
+
+    scalar_empty = scalar_compiled._process_parameters_for_postcompile({"ids": []}).statement
+    tuple_empty_list = tuple_compiled._process_parameters_for_postcompile({"pairs": []}).statement
+    tuple_populated = tuple_compiled._process_parameters_for_postcompile({"pairs": [(7, "seven")]}).statement
+    tuple_empty_tuple = tuple_compiled._process_parameters_for_postcompile({"pairs": ()}).statement
+
+    assert "1 != 1" in scalar_empty
+    assert "IN (SELECT 1, 1 WHERE 1 != 1)" in tuple_empty_list
+    assert "IN ((7, 'seven'))" in tuple_populated
+    assert "IN (SELECT 1, 1 WHERE 1 != 1)" in tuple_empty_tuple
+    assert "POSTCOMPILE" in str(tuple_compiled)
+    assert tuple_statement._generate_cache_key() is not None
+
+
+def test_empty_tuple_not_in_preserves_empty_set_truth_semantics():
+    records = table("records", column("id", Integer), column("label", String))
+    pairs = bindparam("pairs", expanding=True)
+    statement = select(records.c.id).where(tuple_(records.c.id, records.c.label).not_in(pairs))
+    compiled = statement.compile(dialect=_literal_dialect())
+
+    expanded = compiled._process_parameters_for_postcompile({"pairs": []}).statement
+
+    assert "NOT IN (SELECT 1, 1 WHERE 1 != 1)" in expanded
+
+
 @pytest.mark.parametrize("bind_type", [String(), Integer(), NullType()], ids=["string", "integer", "nulltype"])
 @pytest.mark.parametrize("operator", ["equality", "is-not-distinct", "is-distinct"])
 def test_none_postcompile_and_literal_binds_render_sql_null_for_all_declared_sqlalchemy_floors(bind_type, operator):
@@ -555,3 +725,21 @@ def test_none_is_not_confused_with_the_string_null_and_untyped_non_null_values_f
     untyped = untyped_statement.compile(dialect=_literal_dialect())
     with pytest.raises(Exception, match=r"literal|render|quote"):
         untyped._process_parameters_for_postcompile({"candidate": "not typed"})
+
+
+def test_literal_none_preserves_type_should_evaluate_none_opt_in():
+    class EvaluateNoneLiteral(TypeDecorator):
+        impl = String
+        cache_ok = True
+
+        def process_literal_param(self, value, dialect):
+            return "TYPE_HANDLED_NONE" if value is None else value
+
+    value_type = EvaluateNoneLiteral().evaluates_none()
+    statement = select(bindparam("candidate", type_=value_type))
+    compiled = statement.compile(dialect=_literal_dialect())
+
+    expanded = compiled._process_parameters_for_postcompile({"candidate": None}).statement
+
+    assert "'TYPE_HANDLED_NONE'" in expanded
+    assert "SELECT NULL" not in expanded
