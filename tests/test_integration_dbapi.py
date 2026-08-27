@@ -33,13 +33,31 @@ def test_integration_query():
         ("value", sqltypes.BIGINT),
         ("foreignId", sqltypes.BIGINT),
     ]
-    assert [r for r in cursor] == [
-        [1, "one", 1.0, 1.0],
-        [2, "zero", 0.0, 1.0],
-        [3, "negative one", -1.0, 1.0],
+    rows = [r for r in cursor]
+    assert rows == [
+        [1, "one", 1, 1],
+        [2, "zero", 0, 1],
+        [3, "negative one", -1, 1],
         [4, None, None, None],
     ]
+    assert all(type(row[2]) is int for row in rows[:3])
     conn.close()
+
+
+@pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)
+def test_integration_query_preserves_duplicate_column_names_and_width():
+    with new_conn() as conn:
+        cursor = conn.execute("select id, keyName, id from intTable order by id")
+        rows = cursor.fetchall()
+
+        assert [column[0] for column in cursor.description or []] == ["id", "keyName", "id"]
+        assert rows == [
+            [1, "one", 1],
+            [2, "zero", 2],
+            [3, "negative one", 3],
+            [4, None, 4],
+        ]
+        assert all(len(row) == len(cursor.description or []) for row in rows)
 
 
 @pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)

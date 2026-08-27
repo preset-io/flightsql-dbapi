@@ -1,20 +1,243 @@
 name: Test
-on: [push]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11"]
+  lint-and-build:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Lint workflows
+        uses: docker://rhysd/actionlint:1.7.7
+      - name: Lint Python and metadata
+        run: make lint
+      - name: Build wheel and source distribution
+        run: make build
+      - name: Upload immutable test artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
+
+  installed-wheel:
+    name: Python ${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
+    needs: lint-and-build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        sqlalchemy-version: ["1.4.54", "2.0.52"]
+        include:
+          - python-version: "3.10"
+            sqlalchemy-version: "1.4.6"
+            pyarrow-version: "16.0.0"
+            protobuf-version: "4.21.12"
+          - python-version: "3.10"
+            sqlalchemy-version: "2.0.0"
+            pyarrow-version: "16.0.0"
+            protobuf-version: "4.21.12"
+    steps:
+      - uses: actions/checkout@v7
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Lint
-        run: make lint
-      - name: Start Reference Server
-        run: docker compose -f ./docker-compose.yml up --detach
-      - name: Test
-        run: make test INTEGRATION=1
+      - name: Download built distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: distributions
+          path: dist
+      - name: Install wheel into a clean environment
+        env:
+          EXPECTED_PYARROW: ${{ matrix.pyarrow-version || '25.0.1' }}
+          EXPECTED_PROTOBUF: ${{ matrix.protobuf-version || '7.36.0' }}
+          EXPECTED_SQLALCHEMY: ${{ matrix.sqlalchemy-version }}
+        run: |
+          set -euo pipefail
+          python -m venv "${RUNNER_TEMP}/installed"
+          wheel=$(realpath dist/*.whl)
+          "${RUNNER_TEMP}/installed/bin/python" -m pip install \
+            "${wheel}[test]" \
+            "sqlalchemy==${EXPECTED_SQLALCHEMY}" \
+            "pyarrow==${EXPECTED_PYARROW}" \
+            "protobuf==${EXPECTED_PROTOBUF}"
+          "${RUNNER_TEMP}/installed/bin/python" -m pip check
+          "${RUNNER_TEMP}/installed/bin/python" - <<'PY'
+          import importlib.util
+          import os
+
+          import pyarrow
+          import sqlalchemy
+          from google.protobuf import __version__ as protobuf_version
+          from packaging.version import Version
+
+          assert Version(sqlalchemy.__version__) == Version(os.environ["EXPECTED_SQLALCHEMY"])
+          assert Version(pyarrow.__version__) == Version(os.environ["EXPECTED_PYARROW"])
+          assert Version(protobuf_version) == Version(os.environ["EXPECTED_PROTOBUF"])
+          assert importlib.util.find_spec("pandas") is None
+          PY
+      - name: Test installed wheel outside the source tree
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/wheel-tests"
+          cp -R tests "${RUNNER_TEMP}/wheel-tests/tests"
+          cp -R scripts "${RUNNER_TEMP}/wheel-tests/scripts"
+          cd "${RUNNER_TEMP}/wheel-tests"
+          SQLALCHEMY_SILENCE_UBER_WARNING=1 \
+            "${RUNNER_TEMP}/installed/bin/python" -m pytest -q tests
+      - name: Hash referenced local artifact file (not its commit/build linkage)
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          wheel=$(realpath dist/*.whl)
+          digest=$(sha256sum "${wheel}" | cut -d' ' -f1)
+          "${RUNNER_TEMP}/installed/bin/python" -I scripts/verify-installed-provenance \
+            --expected-commit "${EXPECTED_COMMIT}" \
+            --expected-artifact-sha256 "${digest}" \
+            --allow-local-artifact
+
+  installed-artifacts-reference-server:
+    name: Wheel/sdist reference-server boundaries
+    needs: lint-and-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python 3.10 boundary
+        id: python310
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - name: Set up Python 3.14 boundary
+        id: python314
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Download built distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: distributions
+          path: dist
+      - name: Start reference server once
+        run: docker compose -f docker-compose.yml up --detach --build
+      - name: Wait for reference server
+        run: |
+          python - <<'PY'
+          import socket
+          import time
+
+          for _ in range(60):
+              try:
+                  with socket.create_connection(("127.0.0.1", 3000), timeout=1):
+                      break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise RuntimeError("FlightSQL reference server did not start")
+          PY
+      - name: Test wheel and sdist across every SQLAlchemy boundary, without and with pandas
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+          PYTHON_310: ${{ steps.python310.outputs.python-path }}
+          PYTHON_314: ${{ steps.python314.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          wheel=$(realpath dist/*.whl)
+          sdist=$(realpath dist/*.tar.gz)
+          cases=(
+            "py310 ${PYTHON_310} 1.4.6 16.0.0 4.21.12 2.3.3"
+            "py314 ${PYTHON_314} 1.4.54 25.0.1 7.36.0 3.0.5"
+            "py310 ${PYTHON_310} 2.0.0 16.0.0 4.21.12 2.3.3"
+            "py314 ${PYTHON_314} 2.0.52 25.0.1 7.36.0 3.0.5"
+          )
+
+          for boundary in "${cases[@]}"; do
+            read -r python_label python_path sqlalchemy_version pyarrow_version protobuf_version pandas_version \
+              <<<"${boundary}"
+            for artifact_kind in wheel sdist; do
+              if [[ "${artifact_kind}" == "wheel" ]]; then
+                artifact="${wheel}"
+                pandas_requirement=()
+                expected_pandas=""
+              else
+                artifact="${sdist}"
+                pandas_requirement=("pandas==${pandas_version}")
+                expected_pandas="${pandas_version}"
+              fi
+
+              case_name="${python_label}-sa-${sqlalchemy_version}-${artifact_kind}"
+              environment="${RUNNER_TEMP}/environments/${case_name}"
+              test_root="${RUNNER_TEMP}/reference-tests/${case_name}"
+              "${python_path}" -m venv "${environment}"
+              "${environment}/bin/python" -m pip install \
+                "${artifact}[test]" \
+                "sqlalchemy==${sqlalchemy_version}" \
+                "pyarrow==${pyarrow_version}" \
+                "protobuf==${protobuf_version}" \
+                "${pandas_requirement[@]}"
+              "${environment}/bin/python" -m pip check
+
+              EXPECTED_SQLALCHEMY="${sqlalchemy_version}" \
+              EXPECTED_PYARROW="${pyarrow_version}" \
+              EXPECTED_PROTOBUF="${protobuf_version}" \
+              EXPECTED_PANDAS="${expected_pandas}" \
+                "${environment}/bin/python" - <<'PY'
+          import importlib.util
+          import os
+
+          import pyarrow
+          import sqlalchemy
+          from google.protobuf import __version__ as protobuf_version
+          from packaging.version import Version
+
+          assert Version(sqlalchemy.__version__) == Version(os.environ["EXPECTED_SQLALCHEMY"])
+          assert Version(pyarrow.__version__) == Version(os.environ["EXPECTED_PYARROW"])
+          assert Version(protobuf_version) == Version(os.environ["EXPECTED_PROTOBUF"])
+          pandas_spec = importlib.util.find_spec("pandas")
+          if os.environ["EXPECTED_PANDAS"]:
+              import pandas
+
+              assert pandas_spec is not None
+              assert Version(pandas.__version__) == Version(os.environ["EXPECTED_PANDAS"])
+          else:
+              assert pandas_spec is None
+          PY
+
+              artifact_digest=$(sha256sum "${artifact}" | cut -d' ' -f1)
+              "${environment}/bin/python" -I scripts/verify-installed-provenance \
+                --expected-commit "${EXPECTED_COMMIT}" \
+                --expected-artifact-sha256 "${artifact_digest}" \
+                --allow-local-artifact
+
+              mkdir -p "${test_root}"
+              cp -R tests "${test_root}/tests"
+              cp -R scripts "${test_root}/scripts"
+              (
+                cd "${test_root}"
+                INTEGRATION=1 SQLALCHEMY_SILENCE_UBER_WARNING=1 \
+                  "${environment}/bin/python" -m pytest -q tests
+              )
+            done
+          done
+      - name: Show reference-server logs after a failure
+        if: failure()
+        run: docker compose -f docker-compose.yml logs
+      - name: Stop reference server
+        if: always()
+        run: docker compose -f docker-compose.yml down --volumes

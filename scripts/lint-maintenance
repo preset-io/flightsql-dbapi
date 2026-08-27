@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Validate repository-local ownership metadata without claiming GitHub enforcement."""
+
+import re
+import sys
+from pathlib import Path
+
+errors = []
+
+
+def fail(message):
+    errors.append(f"lint-maintenance: {message}")
+
+
+try:
+    codeowners_text = Path("CODEOWNERS").read_text(encoding="utf-8")
+except (OSError, UnicodeError) as error:
+    fail(f"cannot read CODEOWNERS as UTF-8: {error}")
+    codeowners_text = ""
+
+active_rules = []
+for line_number, raw_line in enumerate(codeowners_text.splitlines(), 1):
+    stripped = raw_line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    fields = stripped.split()
+    if len(fields) < 2:
+        fail(f"CODEOWNERS line {line_number} has no owner")
+        continue
+    pattern, owners = fields[0], fields[1:]
+    if (
+        not pattern
+        or pattern.startswith(("#", "!"))
+        or any(character in pattern for character in ("[", "]", "\\", "\x00"))
+        or any(ord(character) < 32 for character in pattern)
+    ):
+        fail(f"CODEOWNERS line {line_number} has an invalid or unsupported pattern {pattern!r}")
+    for owner in owners:
+        if not re.fullmatch(r"@[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)?", owner):
+            fail(f"CODEOWNERS line {line_number} has malformed owner token {owner!r}")
+    active_rules.append((pattern, owners))
+
+if not active_rules:
+    fail("CODEOWNERS has no active rules")
+if not any(pattern in {"*", "/**", "**"} for pattern, _owners in active_rules):
+    fail("CODEOWNERS has no repository-wide rule")
+
+try:
+    maintenance_text = Path("MAINTENANCE.md").read_text(encoding="utf-8")
+except (OSError, UnicodeError) as error:
+    fail(f"cannot read MAINTENANCE.md as UTF-8: {error}")
+    maintenance_text = ""
+
+required_fields = (
+    "Owning organization",
+    "Maintenance function",
+    "Current maintenance coordinator",
+    "GitHub assignment status",
+    "External administrator gates",
+    "Review policy",
+)
+field_values = {}
+for field in required_fields:
+    matches = re.findall(
+        rf"^- \*\*{re.escape(field)}:\*\*(.*)$",
+        maintenance_text,
+        re.MULTILINE,
+    )
+    if len(matches) != 1:
+        fail(f"MAINTENANCE.md must contain exactly one {field!r} field; found {len(matches)}")
+    elif not matches[0].strip():
+        fail(f"MAINTENANCE.md field {field!r} is empty")
+    else:
+        field_values[field] = matches[0].strip()
+
+coordinator_handles = set(
+    re.findall(
+        r"@[A-Za-z0-9][A-Za-z0-9_-]*",
+        field_values.get("Current maintenance coordinator", ""),
+    )
+)
+codeowner_handles = {owner for _pattern, owners in active_rules for owner in owners if "/" not in owner}
+if len(coordinator_handles) != 1:
+    fail("the documented maintenance coordinator must contain exactly one GitHub user handle")
+elif coordinator_handles.isdisjoint(codeowner_handles):
+    fail("the documented maintenance coordinator is not referenced by any user CODEOWNERS rule")
+
+required_disclaimers = {
+    "branch protection": "branch protection",
+    "required human reviews": "human review",
+    "required status checks": "status checks",
+    "automated review is not approval": "is not human approval",
+}
+normalized_maintenance = " ".join(maintenance_text.lower().split())
+for label, phrase in required_disclaimers.items():
+    if phrase.lower() not in normalized_maintenance:
+        fail(f"MAINTENANCE.md does not state the external {label} boundary")
+
+banned_placeholders = ("TBD", "DRI placeholder", "assign the DRI", "Primary DRI and CODEOWNER")
+for placeholder in banned_placeholders:
+    if placeholder.lower() in (codeowners_text + maintenance_text).lower():
+        fail(f"ownership metadata still contains placeholder text {placeholder!r}")
+
+try:
+    packaged = Path("flightsql/provenance.py").read_bytes()
+    standalone = Path("scripts/verify-installed-provenance").read_bytes()
+except OSError as error:
+    fail(f"cannot compare packaged and standalone provenance verifiers: {error}")
+else:
+    if packaged != standalone:
+        fail("flightsql/provenance.py and scripts/verify-installed-provenance differ")
+
+if errors:
+    print("\n".join(errors), file=sys.stderr)
+    raise SystemExit(1)
+
+print(
+    f"lint-maintenance: validated {len(active_rules)} CODEOWNERS rule(s), "
+    f"{len(required_fields)} maintenance fields, and verifier parity"
+)

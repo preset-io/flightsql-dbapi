@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 
-set -eou pipefail
+set -uo pipefail
 
-PYPROJECT_VERSION=$("${VENV_BIN}/toml" get --toml-path pyproject.toml project.version)
-
-FLIGHTSQL_VERSION=$("${VENV_BIN}/python3" <(cat <<EOF
+if [[ -z "${VENV_BIN:-}" ]]; then
+  echo "lint-version: VENV_BIN is not set" >&2
+  exit 1
+fi
+if ! PYPROJECT_VERSION=$("${VENV_BIN}/toml" get --toml-path pyproject.toml project.version); then
+  echo "lint-version: failed to read project.version from pyproject.toml" >&2
+  exit 1
+fi
+if ! FLIGHTSQL_VERSION=$("${VENV_BIN}/python3" - <<'PY'
 from flightsql import __version__
 print(__version__)
-EOF
-))
-
-[[ "$PYPROJECT_VERSION" == "$FLIGHTSQL_VERSION" ]] || (echo "Versions in pyproject.toml and flightsql/__init__.py don't agree." && exit 1)
+PY
+); then
+  echo "lint-version: failed to import flightsql.__version__" >&2
+  exit 1
+fi
+if [[ "$PYPROJECT_VERSION" != "$FLIGHTSQL_VERSION" ]]; then
+  printf "lint-version: pyproject.toml has %q, flightsql.__version__ has %q\n" \
+    "$PYPROJECT_VERSION" "$FLIGHTSQL_VERSION" >&2
+  exit 1
+fi
+printf 'lint-version: versions agree at %s\n' "$PYPROJECT_VERSION"
