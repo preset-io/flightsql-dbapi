@@ -102,22 +102,27 @@ consumers must not assume complete third-party type information.
 ## Release and installation channel
 
 Preset does not own the existing public PyPI project named `flightsql-dbapi`.
-This fork must never upload an artifact under that public distribution name.
-The public-publish workflow has therefore been removed.
+This fork must never upload an artifact to public PyPI under that distribution
+name. The public-publish workflow has therefore been removed.
 
-`superset-shell` historically installs the fork with a PEP 508 direct reference
-to `https://github.com/preset-io/flightsql-dbapi.git` at a full commit SHA. That
-remains the release channel:
+The release channel is the internal Preset package index, backed by the
+`preset-pypi` object store. `Jenkinsfile` in this repository builds and
+publishes the wheel from `main`; `superset-shell` pins the resulting immutable
+artifact URL together with its SHA-256. A PEP 508 direct reference to
+`https://github.com/preset-io/flightsql-dbapi.git` at a full commit SHA remains
+supported where a source pin is required instead.
 
 1. Merge a reviewed, green commit in this repository.
 2. Record the internal fork version in `pyproject.toml` and
-   `flightsql/__init__.py` (currently `0.2.3+preset.2`; `preset.1` candidate
-   artifacts already exist and must not be reused).
+   `flightsql/__init__.py` (currently `0.2.2.1`). Published artifacts are
+   immutable and are never rebuilt in place, so any subsequent change ships as
+   a new fourth component (`0.2.2.2`, and so on). The pipeline refuses to
+   overwrite an existing key rather than relying on this being remembered.
 3. Run the installed-wheel matrix and the reference-server suite.
-4. Pin the consumer to the immutable 40-character commit SHA. A source archive
-   generated from that same SHA and pinned by SHA-256 is acceptable where Git
-   installation is not.
-5. Record the tested SHA and matrix result in the consumer change.
+4. Pin the consumer to the immutable artifact URL and its SHA-256. Where a
+   source pin is used instead, pin the immutable 40-character commit SHA, or a
+   source archive generated from that same SHA and pinned by SHA-256.
+5. Record the tested version, digest and matrix result in the consumer change.
 
 The consumer must repeat the direct reference in a constraints file and pass it
 to every resolver invocation. After installation, copy the self-contained
@@ -161,21 +166,32 @@ expected commit remains context rather than build evidence.
 
 The distribution name remains `flightsql-dbapi` because Superset requirements,
 the `flightsql` import package, and SQLAlchemy entry-point metadata already use
-that identity. The PEP 440 local version segment (`+preset.N`) distinguishes a
-fork build without claiming a public upstream release. If Preset ever needs an
-artifact registry rather than source pins, it must first choose a distinct
-distribution name (for example, `preset-flightsql-dbapi`) and complete an
-explicit packaging, migration, security, and ownership review.
+that identity. The version carries the fork identity instead: upstream `X.Y.Z`
+becomes Preset `X.Y.Z.N`. That is the four-component convention already used
+throughout this index (PyHive `0.7.0.1`, Exasol `7.1.3.1`, Drill `1.1.11.1`,
+pinotdb `9.1.2.1`). Upstream's last public release is `0.2.2`, so the Preset
+build is `0.2.2.1`.
 
-`0.2.3+preset.2` does **not** create a globally unique distribution identity.
-Under PEP 440 it sorts after public `0.2.3` but before public `0.2.4`, and a
-specifier such as `==0.2.3` also admits the local version. A resolver or later
-unconstrained upgrade can therefore select a public build. The local suffix is
-diagnostic only. Layered source controls are the direct-reference constraint,
-immutable full SHA, archive/artifact digest where applicable, fresh-environment
-installation, and the scoped post-install assertion. They do not turn mutable
-installed metadata into an attestation. Never treat version equality alone as
-proof of source.
+This replaced an earlier PEP 440 local version, `0.2.3+preset.2`, which was
+unsafe for one specific reason: a local version is *matched* by the
+corresponding public specifier. `==0.2.3` admits `0.2.3+preset.2`, so a
+resolver asked for the public release could silently receive the Preset build,
+and an unconstrained upgrade could silently replace the Preset build with a
+public one. It also claimed a base release, `0.2.3`, that upstream never
+published.
+
+`0.2.2.1` is a distinct public release rather than a variant of one. No
+`==0.2.2` specifier admits it, it sorts above the last public release `0.2.2`
+and below `0.2.4`, and it therefore never shadows a version upstream could
+still publish. Avoiding `+` also keeps the pinned artifact URL free of `%2B`
+encoding.
+
+A distinct version is an identity, not an attestation. The layered source
+controls remain the pinned immutable artifact URL and its externally recorded
+SHA-256 -- or the direct-reference constraint and immutable full SHA where a
+source pin is used -- fresh-environment installation, and the scoped
+post-install assertion. They do not turn mutable installed metadata into an
+attestation. Never treat version equality alone as proof of source.
 
 ## Dependency and security cadence
 

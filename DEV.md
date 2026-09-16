@@ -26,7 +26,7 @@ from a separately verified checkout and invoke it with narrowed path inputs:
 ```console
 python -I /trusted/verify-installed-provenance \
   --expected-commit <full-commit-sha> \
-  --expected-version 0.2.3+preset.2
+  --expected-version 0.2.2.1
 ```
 
 This rejects the public 0.2.2 build, any other version, index installs without
@@ -47,7 +47,7 @@ Superset Docker directory and serve a freshly built source distribution. For
 example:
 
 ```
-flightsql-dbapi @ http://docker.for.mac.host.internal:8000/dist/flightsql_dbapi-0.2.3+preset.2.tar.gz
+flightsql-dbapi @ http://docker.for.mac.host.internal:8000/dist/flightsql_dbapi-0.2.2.1.tar.gz
 ```
 
 Local artifacts do not encode their source commit. For a controlled test, retain
