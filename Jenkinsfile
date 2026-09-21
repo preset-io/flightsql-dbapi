@@ -2,7 +2,7 @@
 //
 // Publishes to the Preset-internal package index, which is backed by the
 // s3://preset-pypi bucket.  Every operation in this file talks to the bucket
-// over the AWS API using the runtime-bound 'ci-user' credential.  This
+// over the AWS API using 'ci-user', bound only for explicit main releases. This
 // repository is PUBLIC, so the index's public hostname is deliberately not
 // referenced here, in any commit message, or in any pull request: consumers
 // resolve the artifact through the documented internal index base URL, which
@@ -11,6 +11,17 @@
 // Modelled on the existing Preset publishers (sqlalchemy-exasol,
 // sqlalchemy-drill, pinot-dbapi).  No credential material lives in this file:
 // the AWS keys are bound at runtime by Jenkins and are never echoed.
+//
+// JENKINS ADMIN PRECONDITION (see MAINTENANCE.md)
+// ---------------------------------------------
+// This public repository's branch-controlled Jenkinsfile is NOT a security
+// boundary. Never execute an untrusted PR on a credential-capable job/agent.
+// Disable fork PR discovery on this publisher; if enabled in a separate,
+// credential-free validation job, use GitHub Branch Source trust "Nobody"
+// (merge target's Jenkinsfile), NEVER "Everyone". Origin PR authors must be
+// trusted writers. A trusted Jenkinsfile alone does not make PR build/test
+// code safe. Isolate untrusted agents from publisher credentials, pull secrets,
+// service accounts and workspaces. Admin verification is required before use.
 //
 // WHAT IS PUBLISHED
 // -----------------
@@ -40,12 +51,12 @@
 // 0.2.2.1, declared in pyproject.toml so the published version is auditable in
 // git rather than synthesised here.
 //
-//   * main        -> stable 0.2.2.1.  Published ONLY from reviewed, merged
-//                    Preset history.
-//   * PR branches -> 0.2.2.1+PR-<n>.<shortsha>, a PEP 440 local version that
-//                    is deliberately NOT a stable release.  A PR build can
-//                    never emit the bare stable version; this is asserted
-//                    below rather than left to convention.
+//   * main        -> stable 0.2.2.1; build and verify on every push, publish
+//                    ONLY with PUBLISH_RELEASE=true after human release review.
+//   * PR branches -> 0.2.2.1+pr.<n>.<shortsha>, for build/install checks ONLY.
+//                    No S3 access, credential binding or index publication.
+//                    Local versions match ==0.2.2.1 and sort above it, so
+//                    immutable PR URLs in the shared index are NOT safe here.
 //
 // A four-component version is used rather than a PEP 440 local version such as
 // 0.2.3+preset.2 because a local version is MATCHED by the corresponding
@@ -83,6 +94,13 @@ LIB_NAME = 'flightsql-dbapi'
 DIST_NAME = 'flightsql_dbapi'
 BUCKET = 'preset-pypi'
 
+// Default-off release intent prevents docs/CI merges from republishing the
+// unchanged version. Releasing an existing version still fails closed.
+properties([parameters([
+    booleanParam(name: 'PUBLISH_RELEASE', defaultValue: false,
+                 description: 'Publish a reviewed main release with a NEW version; never enabled for PRs.')
+])])
+
 String baseVersion = ""
 String publishVersion = ""
 String wheelName = ""
@@ -97,7 +115,9 @@ podTemplate(
         containerTemplate(
             alwaysPullImage: true,
             name: 'ci',
-            image: 'preset/ci:latest',
+            // preset-io/docker-images build-ci #3679, source 2226e0e250f1.
+            // Use the push digest, not the rebuildable 2025-10-08 tag.
+            image: 'preset/ci@sha256:4b63a26fefede56a1bc0ba566dc2078f0bbeb1c563735b73ec55661f8505a5d2',
             ttyEnabled: true,
             command: 'cat',
             resourceRequestCpu: '100m',
@@ -124,9 +144,9 @@ podTemplate(
                 script: 'git rev-parse --short HEAD'
         ).trim()
 
-        boolean isMain = (env.BRANCH_NAME == 'main')
-        boolean isPullRequest = env.BRANCH_NAME.startsWith('PR-')
-        boolean publishes = isMain || isPullRequest
+        boolean isPullRequest = env.CHANGE_ID || env.BRANCH_NAME.startsWith('PR-')
+        boolean isMain = (env.BRANCH_NAME == 'main' && !isPullRequest)
+        boolean publishes = isMain && params.PUBLISH_RELEASE == true
 
         container('py-ci') {
             stage('Resolve version') {
@@ -147,12 +167,10 @@ podTemplate(
                     // lower-cased and '-'/'_' become '.'.  The build backend
                     // therefore writes 'pr.7.abc1234', not 'PR-7.abc1234', into
                     // the artifact filename.  Normalising here rather than
-                    // predicting the raw branch name keeps the key used by the
-                    // existence check, the upload and the read-back identical
-                    // to the file actually produced; otherwise the check probes
-                    // a key that can never exist.  The assertion after the
-                    // build fails closed if a backend ever normalises
-                    // differently than this.
+                    // predicting the raw branch name keeps the build filename
+                    // and local install check identical to the actual artifact.
+                    // PR artifacts never reach the bucket. The post-build
+                    // assertion fails if backend normalisation changes.
                     String localSegment = "${env.BRANCH_NAME}.${shortGitRev}".toLowerCase().replaceAll(/[-_]/, '.')
                     publishVersion = "${baseVersion}+${localSegment}"
                 } else {
@@ -172,7 +190,7 @@ podTemplate(
                 sdistName = "${DIST_NAME}-${publishVersion}.tar.gz"
                 key = "${LIB_NAME}/${wheelName}"
                 echo "Base version: ${baseVersion}"
-                echo "Publish version: ${publishVersion}${isMain ? ' (STABLE)' : ' (pre-release)'}"
+                echo "Publish version: ${publishVersion}${isMain ? ' (STABLE)' : ' (local test build; NOT published)'}"
             }
 
             stage('Tests') {
@@ -184,7 +202,7 @@ podTemplate(
                 // Actions workflow on this repo; this run is a gate on the
                 // commit being published, not a substitute for it.
                 //
-                // Runs BEFORE the pre-release version is applied, so the
+                // Runs BEFORE the local test version is applied, so the
                 // version linter and the packaging tests see the declared
                 // version rather than the rewritten one.
                 sh(
@@ -199,7 +217,7 @@ podTemplate(
         container('ci') {
             stage('Reject an already-published version') {
                 if (!publishes) {
-                    echo "Branch '${env.BRANCH_NAME}' does not publish. Skipping."
+                    echo 'No explicit main release requested; skipping S3 lookup and credentials.'
                     return
                 }
                 withCredentials([
@@ -245,7 +263,7 @@ podTemplate(
                             grep -q '^version = \"${publishVersion}\"' pyproject.toml
                             grep -q '^__version__ = \"${publishVersion}\"' flightsql/__init__.py
                         """,
-                        label: 'Apply pre-release version'
+                        label: 'Apply local test version'
                     )
                 }
 
@@ -381,7 +399,7 @@ EOF
         container('ci') {
             stage('Publish wheel') {
                 if (!publishes) {
-                    echo "Branch ${env.BRANCH_NAME} does not publish; built and verified only."
+                    echo 'No explicit main release requested; built and verified only, without publication.'
                     return
                 }
                 withCredentials([

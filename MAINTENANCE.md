@@ -107,22 +107,78 @@ name. The public-publish workflow has therefore been removed.
 
 The release channel is the internal Preset package index, backed by the
 `preset-pypi` object store. `Jenkinsfile` in this repository builds and
-publishes the wheel from `main`; `superset-shell` pins the resulting immutable
+publishes the wheel only from an explicit `main` release build; `superset-shell` pins the resulting immutable
 artifact URL together with its SHA-256. A PEP 508 direct reference to
 `https://github.com/preset-io/flightsql-dbapi.git` at a full commit SHA remains
 supported where a source pin is required instead.
 
-1. Merge a reviewed, green commit in this repository.
-2. Record the internal fork version in `pyproject.toml` and
+1. Record the internal fork version in `pyproject.toml` and
    `flightsql/__init__.py` (currently `0.2.2.1`). Published artifacts are
    immutable and are never rebuilt in place, so any subsequent change ships as
    a new fourth component (`0.2.2.2`, and so on). The pipeline refuses to
    overwrite an existing key rather than relying on this being remembered.
-3. Run the installed-wheel matrix and the reference-server suite.
+2. Run the installed-wheel matrix and the reference-server suite, and merge the
+   reviewed, green version change.
+3. In the Jenkins **main** branch job, use **Build with Parameters** and explicitly
+   select `PUBLISH_RELEASE=true` for the reviewed main head. The first automatic
+   main build installs the parameter with a false default. Ordinary main pushes
+   and PR builds run tests, double-build reproducibility and installed-artifact
+   checks without S3 calls or AWS credential binding. Do not configure a trigger
+   to pass true by default. A release retry for an existing key fails closed;
+   inspect the original release rather than overwriting it.
 4. Pin the consumer to the immutable artifact URL and its SHA-256. Where a
    source pin is used instead, pin the immutable 40-character commit SHA, or a
    source archive generated from that same SHA and pinned by SHA-256.
 5. Record the tested version, digest and matrix result in the consumer change.
+
+### Jenkins administrator prerequisite
+
+Before enabling this publisher, an administrator must verify its GitHub Branch
+Source trust configuration and agent/credential isolation. This is a **public**
+repository: branch checks and `PUBLISH_RELEASE` in a branch-controlled
+Jenkinsfile are release policy, **not** protection against a malicious pipeline.
+
+- Disable **Discover pull requests from forks** on the credential-capable
+  publisher. The inspected job currently discovers origin PRs, not fork PRs;
+  this observation is not a guarantee of future configuration.
+- If fork validation is needed, use a separate credential-free job and agents,
+  with fork trust **Nobody** (use the merge target's Jenkinsfile), never
+  **Everyone**. Origin PR authors must be trusted repository writers. Restrict
+  job configuration, release triggering and repository write access to trusted
+  maintainers. Do not equate an external contributor with a trusted writer.
+- Using the target Jenkinsfile does not make checked-out PR code safe: tests,
+  package installation and build hooks execute it. Untrusted jobs must not have
+  access to `ci-user`, publisher workspaces, registry pull secrets or privileged
+  service accounts, including ambient cloud credentials. Keep the publisher
+  disabled if these conditions cannot be met.
+
+See Jenkins' [SCM credential security guidance](https://www.jenkins.io/doc/book/security/securing-org-folders-and-multibranch-pipelines/)
+and [GitHub Branch Source trust behavior](https://www.jenkins.io/doc/pipeline/steps/workflow-scm-step/).
+Repository tests do not certify these external controls.
+
+The credentialed `ci` container is pinned by manifest digest, sourced from the
+successful `preset-io/docker-images` `build-ci` job **3679**, source commit
+`2226e0e250f1bd1c2e4c07a50e7638415f2a14b6`. Its `2025-10-08` tag is rebuilt in
+place, so a date tag is not an immutability guarantee. Image updates require a
+reviewed digest change and a green build.
+
+### Why Drill's PR publication policy is not used here
+
+Drill deliberately publishes immutable PR local versions for consumers that
+pin exact artifact URLs. That protects the bytes at that URL; it does not
+protect name/version resolution. For this distribution,
+`0.2.2.1+pr.7.abc1234` matches `==0.2.2.1` and sorts above `0.2.2.1` under
+[PEP 440 version matching](https://packaging.python.org/en/latest/specifications/version-specifiers/#version-matching).
+Publishing both into the shared `flightsql-dbapi/` prefix would reintroduce this
+PR's stated shadowing hazard. This public repo also requires the independent
+Jenkins trust controls above; URL immutability does not protect AWS credentials.
+
+PR local versions are therefore used only for build/install checks, never
+uploaded to the shared index. The published stable URL has no `+` or `%2B`.
+This policy prevents **new** PR uploads; it does not remove previously published
+PR objects. Before consumer rollout, the index owner must inventory and exclude
+any historical PR local-version candidates from name-based index resolution.
+Do not delete or replace immutable artifacts that existing URL pins may use.
 
 The consumer must repeat the direct reference in a constraints file and pass it
 to every resolver invocation. After installation, copy the self-contained

@@ -24,6 +24,11 @@ jobs:
           python-version: "3.11"
       - name: Lint workflows
         uses: docker://rhysd/actionlint:1.7.7
+      - name: Validate Jenkins publication policy and generated shell syntax
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y groovy
+          groovy scripts/test-jenkinsfile.groovy
       - name: Lint Python and metadata
         run: make lint
       - name: Build wheel and source distribution
