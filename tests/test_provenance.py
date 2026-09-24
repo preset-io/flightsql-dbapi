@@ -13,7 +13,7 @@ import packaging
 import pytest
 
 EXPECTED_COMMIT = "a" * 40
-EXPECTED_VERSION = "0.2.3+preset.2"
+EXPECTED_VERSION = "0.2.2.1"
 EXPECTED_HASH = "b" * 64
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "verify-installed-provenance"
@@ -136,7 +136,7 @@ def test_provenance_json_names_the_narrow_recorded_hash_scope(tmp_path):
         "--expected-commit",
         mixed_case_commit.upper(),
         "--expected-version",
-        "0.2.3+PRESET.2",
+        "0.2.2.1",
         "--json",
     )
 

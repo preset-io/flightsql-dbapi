@@ -41,16 +41,27 @@ def test_untrusted_installed_provenance_console_entrypoint_is_absent():
 def test_fork_has_non_pypi_release_identity():
     installed_version = Version(version("flightsql-dbapi"))
 
-    assert installed_version == Version("0.2.3+preset.2")
-    assert installed_version.local == "preset.2"
+    assert installed_version == Version("0.2.2.1")
+    assert installed_version.local is None
 
 
-def test_local_version_is_diagnostic_not_a_public_replacement_barrier():
-    fork = Version("0.2.3+preset.2")
+def test_fork_version_is_distinct_from_every_public_release():
+    # The fork version is a four-component public version, not a PEP 440 local
+    # version.  That is the whole point: a local version such as 0.2.3+preset.2
+    # is *matched* by the specifier ==0.2.3, so a resolver asked for the public
+    # release can silently select the Preset build and vice versa.  A fourth
+    # component is a distinct release that no public specifier admits.
+    fork = Version("0.2.2.1")
+    upstream = Version("0.2.2")
 
-    assert fork > Version("0.2.3")
-    assert fork < Version("0.2.4")
-    assert fork in SpecifierSet("==0.2.3")
+    assert fork not in SpecifierSet(f"=={upstream}")
+    assert upstream not in SpecifierSet(f"=={fork}")
+    assert fork.local is None
+
+    # It sorts above the last public release and below the next one upstream
+    # could ever publish, so it never shadows a future public version.
+    assert fork > upstream
+    assert fork < Version("0.2.3")
 
 
 def test_packaging_is_honest_about_partial_typing_support():
