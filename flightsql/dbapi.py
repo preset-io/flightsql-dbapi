@@ -8,7 +8,7 @@ from sqlalchemy import types
 
 from flightsql.client import FlightSQLClient, TableRef
 from flightsql.exceptions import DataError, Error, NotSupportedError
-from flightsql.util import check_closed
+from flightsql.util import check_closed, translate_errors
 
 paramstyle = "qmark"
 apilevel = "2.0"
@@ -30,6 +30,8 @@ class TableMetadataResult:
     table_names: List[str]
     columns_by_name: Optional[Dict[str, List[Dict]]]
     included_schema_supported: bool
+    table_types: Optional[Dict[str, Optional[str]]] = None
+    """GetTables ``table_type`` per name when the server reports it."""
 
 
 def check_result(f):
@@ -64,6 +66,7 @@ class Cursor:
         self.closed = True
 
     @check_closed
+    @translate_errors
     def execute(self, query: str, params: Optional[ExecuteParams] = None) -> "Cursor":
         self.description = None
         self._results = []
@@ -75,13 +78,14 @@ class Cursor:
             return self
 
         with self.client.prepare(query) as stmt:
-            builder = ParameterRecordBuilder(params or ())
-            record = builder.build_record()
+            record = build_parameter_record(params or (), stmt.parameter_schema)
             info = stmt.execute(record)
             reader = self.client.do_get(info.endpoints[0].ticket)
             self._results, self.description = dbapi_results(reader.read_all())
             return self
 
+    @check_closed
+    @translate_errors
     def executemany(self, query: str, param_seq: Sequence[ExecuteParams]) -> "Cursor":
         self.description = None
         self._results = []
@@ -91,8 +95,7 @@ class Cursor:
 
         with self.client.prepare(query) as stmt:
             for params in param_seq:
-                builder = ParameterRecordBuilder(params or ())
-                record = builder.build_record()
+                record = build_parameter_record(params or (), stmt.parameter_schema)
                 info = stmt.execute(record)
                 self.client.do_get(info.endpoints[0].ticket).read_all()
             return self
@@ -136,10 +139,14 @@ class Cursor:
 
 
 class Connection:
-    def __init__(self, client: FlightSQLClient, **kwargs):
+    def __init__(self, client: FlightSQLClient, catalog: Optional[str] = None, **kwargs):
         self.client = client
         self.closed = False
         self.cursors: List[Cursor] = []
+        # An explicit catalog scopes every metadata RPC. Without one it is
+        # resolved lazily by _metadata_catalog().
+        self.catalog = catalog
+        self._resolved_catalog: Optional[Tuple[Optional[str]]] = None
 
     def __enter__(self) -> "Connection":
         return self
@@ -188,6 +195,7 @@ class Connection:
         return metadata.get(table_name, [])
 
     @check_closed
+    @translate_errors
     def flightsql_get_table_metadata_for_table(
         self, table_name: str, schema: Optional[str] = None
     ) -> TableMetadataResult:
@@ -198,26 +206,22 @@ class Connection:
         bulk row from a server that returns zero rows whenever include_schema
         is requested.  Transport and reader failures deliberately propagate.
         """
-        info = self.client.get_tables(
-            table_name_filter_pattern=table_name,
-            db_schema_filter_pattern=schema,
-            include_schema=True,
+        result = self._get_table_metadata(
+            schema, table_name_filter_pattern=table_name, db_schema_filter_pattern=schema, include_schema=True
         )
-        result = self._table_metadata_from_info(info, requested_schema=schema)
         if result.table_names:
             return result
 
-        names_info = self.client.get_tables(
-            table_name_filter_pattern=table_name,
-            db_schema_filter_pattern=schema,
-        )
-        names = self._table_metadata_from_info(names_info, requested_schema=schema).table_names
+        names = self._get_table_metadata(
+            schema, table_name_filter_pattern=table_name, db_schema_filter_pattern=schema
+        ).table_names
         exact_names = [name for name in names if name == table_name]
         if exact_names:
-            return TableMetadataResult(exact_names, None, False)
+            return TableMetadataResult(exact_names, None, False, None)
         return result
 
     @check_closed
+    @translate_errors
     def flightsql_get_table_metadata(self, schema: Optional[str] = None) -> TableMetadataResult:
         """Get table names and any included Arrow schemas in one request.
 
@@ -225,34 +229,80 @@ class Connection:
         that omits/does not populate ``table_schema`` is a degraded names-only
         result. Flight transport errors deliberately propagate.
         """
-        info = self.client.get_tables(db_schema_filter_pattern=schema, include_schema=True)
-        result = self._table_metadata_from_info(info, requested_schema=schema)
+        result = self._get_table_metadata(schema, db_schema_filter_pattern=schema, include_schema=True)
         if not result.table_names and result.columns_by_name == {}:
             # Some servers answer the unsupported include_schema variant with
             # zero rows. A names-only request is the only way to distinguish
             # that behavior from a genuinely empty catalog.
-            table_names = self.flightsql_get_table_names(schema)
-            if table_names:
-                return TableMetadataResult(table_names, None, False)
+            names_only = self._get_table_metadata(schema, db_schema_filter_pattern=schema)
+            if names_only.table_names:
+                return TableMetadataResult(names_only.table_names, None, False, names_only.table_types)
         return result
 
     @check_closed
+    @translate_errors
     def flightsql_get_table_names(self, schema: Optional[str] = None) -> List[str]:
         """Get the names of all tables within the schema."""
-        info = self.client.get_tables(db_schema_filter_pattern=schema)
-        return self._table_metadata_from_info(info, requested_schema=schema).table_names
+        return self._get_table_metadata(schema, db_schema_filter_pattern=schema).table_names
 
     @check_closed
+    @translate_errors
     def flightsql_get_schema_names(self) -> List[str]:
         """Get the names of all schemas."""
-        info = self.client.get_db_schemas()
+        names = self._schema_names(self._metadata_catalog())
+        if not names and self._catalog_fallback():
+            names = self._schema_names(self._metadata_catalog())
+        # A server answering for every catalog can repeat a schema name.
+        return list(dict.fromkeys(names))
+
+    def _schema_names(self, catalog: Optional[str]) -> List[str]:
+        info = self.client.get_db_schemas(**_catalog_kwargs(catalog))
         names: List[str] = []
         for table in self._tables_from_info(info):
             if "db_schema_name" in table.column_names:
                 names.extend(table.column("db_schema_name").to_pylist())
         return names
 
+    def _metadata_catalog(self) -> Optional[str]:
+        """Catalog scoping metadata RPCs: configured, else resolved, else None."""
+        if self.catalog is not None:
+            return self.catalog
+        return self._resolved_catalog[0] if self._resolved_catalog else None
+
+    def _catalog_fallback(self) -> bool:
+        """Resolve a catalog after an unscoped metadata RPC came back empty.
+
+        Flight SQL defines an unset catalog as "no filtering", and compliant
+        servers answer GetDbSchemas/GetTables across every catalog, so they
+        never reach this path. Some servers (the DataFusion Flight SQL service
+        among them) only enumerate the catalog named in the request and return
+        zero rows otherwise, which would hide every schema and table. Resolve
+        one catalog from GetCatalogs -- DataFusion's default ``datafusion`` if
+        present, else the only catalog -- once per connection, and return
+        whether the caller should retry scoped to it. A server without
+        GetCatalogs keeps the unscoped (empty) answer.
+        """
+        if self.catalog is not None or self._resolved_catalog is not None:
+            return False
+        resolved: Optional[str] = None
+        try:
+            info = self.client.get_catalogs()
+        except pa.ArrowNotImplementedError:
+            info = None
+        if info is not None:
+            catalogs: List[str] = []
+            for table in self._tables_from_info(info):
+                if "catalog_name" in table.column_names:
+                    catalogs.extend(name for name in table.column("catalog_name").to_pylist() if name)
+            if "datafusion" in catalogs:
+                resolved = "datafusion"
+            elif len(set(catalogs)) == 1:
+                resolved = catalogs[0]
+        self._resolved_catalog = (resolved,)
+        return resolved is not None
+
     @check_closed
+    @translate_errors
     def flightsql_get_sql_info(self, info: List[int]) -> Dict[int, Any]:
         """Get metadata about the server and its SQL features."""
         finfo = self.client.get_sql_info(info)
@@ -261,6 +311,7 @@ class Connection:
         return {v["info_name"]: v["value"] for v in values}
 
     @check_closed
+    @translate_errors
     def flightsql_get_primary_keys(self, table: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
         ref = TableRef(table=table, db_schema=schema)
         info = self.client.get_primary_keys(ref)
@@ -268,11 +319,21 @@ class Connection:
         return reader.read_all().to_pylist()
 
     @check_closed
+    @translate_errors
     def flightsql_get_foreign_keys(self, table: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
         ref = TableRef(table=table, db_schema=schema)
         info = self.client.get_imported_keys(ref)
         reader = self.client.do_get(info.endpoints[0].ticket)
         return reader.read_all().to_pylist()
+
+    def _get_table_metadata(self, requested_schema: Optional[str], **request: Any) -> TableMetadataResult:
+        """GetTables scoped to the metadata catalog, with the empty-answer fallback."""
+        info = self.client.get_tables(**request, **_catalog_kwargs(self._metadata_catalog()))
+        result = self._table_metadata_from_info(info, requested_schema=requested_schema)
+        if not result.table_names and self._catalog_fallback():
+            info = self.client.get_tables(**request, **_catalog_kwargs(self._metadata_catalog()))
+            result = self._table_metadata_from_info(info, requested_schema=requested_schema)
+        return result
 
     def _tables_from_info(self, info: Any) -> List[pa.Table]:
         try:
@@ -311,12 +372,32 @@ class Connection:
             return TableMetadataResult([], {}, True)
 
         table_names = list(dict.fromkeys(name for name, _schema, _serialized, _present in rows))
+        table_types = self._table_types(tables, requested_schema)
         metadata = self._parse_table_schema_rows(rows, requested_schema)
         if len(metadata) == len(table_names):
-            return TableMetadataResult(table_names, metadata, True)
+            return TableMetadataResult(table_names, metadata, True, table_types)
         if not saw_table_schema:
-            return TableMetadataResult(table_names, None, False)
-        return TableMetadataResult(table_names, metadata, False)
+            return TableMetadataResult(table_names, None, False, table_types)
+        return TableMetadataResult(table_names, metadata, False, table_types)
+
+    @staticmethod
+    def _table_types(tables: List[pa.Table], requested_schema: Optional[str]) -> Optional[Dict[str, Optional[str]]]:
+        if not all("table_type" in table.column_names for table in tables):
+            return None
+        table_types: Dict[str, Optional[str]] = {}
+        for table in tables:
+            schema_names = (
+                table.column("db_schema_name").to_pylist()
+                if "db_schema_name" in table.column_names
+                else [None] * table.num_rows
+            )
+            for name, row_schema, table_type in zip(
+                table.column("table_name").to_pylist(), schema_names, table.column("table_type").to_pylist()
+            ):
+                if requested_schema is not None and row_schema not in (None, requested_schema):
+                    continue
+                table_types.setdefault(name, table_type)
+        return table_types
 
     @staticmethod
     def _table_metadata_rows(
@@ -393,6 +474,10 @@ class Connection:
     @property
     def features(self) -> Dict[str, str]:
         return self.client.features
+
+
+def _catalog_kwargs(catalog: Optional[str]) -> Dict[str, Any]:
+    return {} if catalog is None else {"catalog": catalog}
 
 
 def connect(client: FlightSQLClient, **kwargs) -> Connection:
@@ -652,50 +737,103 @@ def _normalize_temporal_union_array(array: pa.UnionArray, target_type: pa.DataTy
     return normalized
 
 
-def arrow_column_descriptions(schema: pa.Schema) -> List[Tuple[str, Any]]:
-    """Map Arrow schema fields to SQL types."""
+def arrow_column_descriptions(schema: pa.Schema) -> List[Tuple[Any, ...]]:
+    """Map Arrow schema fields to PEP 249 seven-item column descriptions.
+
+    ``(name, type_code, display_size, internal_size, precision, scale, null_ok)``;
+    ``type_code`` is a SQLAlchemy type instance, and precision/scale are filled
+    for decimal columns.
+    """
     description = []
-    for i, t in enumerate(schema.types):
-        description.append((schema.names[i], resolve_sql_type(t)))
+    for field in schema:
+        precision = scale = None
+        storage = field.type.value_type if pa.types.is_dictionary(field.type) else field.type
+        if pa.types.is_decimal(storage):
+            precision, scale = storage.precision, storage.scale
+        description.append((field.name, resolve_sql_type(field.type), None, None, precision, scale, field.nullable))
     return description
 
 
-def resolve_sql_type(t: pa.DataType):
-    """Resolves an Arrow DataType value to a SQL type."""
+# DOUBLE_PRECISION is SQLAlchemy 2.0+; FLOAT(53) is the same IEEE double on 1.4.
+_DOUBLE = getattr(types, "DOUBLE_PRECISION", None) or (lambda: types.Float(precision=53))
 
+# Scalar Arrow type predicates in resolution order, each with a SQL type factory.
+_SCALAR_SQL_TYPES: List[Tuple[Tuple[str, ...], Any]] = [
+    (("is_time",), types.TIME),
+    (("is_date",), types.DATE),
+    (("is_boolean",), types.BOOLEAN),
+    (("is_duration", "is_interval"), types.Interval),
+    (("is_float16", "is_float32"), types.REAL),
+    (("is_floating",), _DOUBLE),
+    (("is_string", "is_large_string", "is_string_view"), types.VARCHAR),
+    (("is_binary", "is_large_binary", "is_fixed_size_binary", "is_binary_view"), types.VARBINARY),
+    (("is_int8", "is_int16", "is_uint8"), types.SMALLINT),
+    (("is_int32", "is_uint16"), types.INTEGER),
+    (("is_int64", "is_uint32"), types.BIGINT),
+    (("is_uint64",), lambda: types.NUMERIC(precision=20, scale=0)),
+]
+_LIST_PREDICATES = ("is_list", "is_large_list", "is_fixed_size_list", "is_list_view", "is_large_list_view")
+_NESTED_PREDICATES = ("is_struct", "is_map", "is_union")
+
+
+def resolve_sql_type(t: pa.DataType) -> types.TypeEngine:
+    """Resolve an Arrow DataType to a SQLAlchemy type instance.
+
+    Instances (not classes) are returned so reflected types render as SQL type
+    names and keep their parameters: decimal precision/scale, timestamp time
+    zone awareness and list element types. Unsigned integers map to the
+    smallest signed SQL type that holds their full range.
+    """
+    if isinstance(t, pa.BaseExtensionType):
+        return resolve_sql_type(t.storage_type)
+    if pa.types.is_dictionary(t):
+        return resolve_sql_type(t.value_type)
     if pa.types.is_timestamp(t):
-        return types.TIMESTAMP
-    if pa.types.is_time(t):
-        return types.TIME
-    if pa.types.is_date(t):
-        return types.DATE
-    if pa.types.is_binary(t):
-        return types.BINARY
-    if pa.types.is_boolean(t):
-        return types.BOOLEAN
+        return types.TIMESTAMP(timezone=t.tz is not None)
     if pa.types.is_decimal(t):
-        return types.DECIMAL
-    if pa.types.is_duration(t):
-        return types.Interval
-    if pa.types.is_floating(t):
-        return types.FLOAT
-    if pa.types.is_string(t):
-        return types.TEXT
+        return types.DECIMAL(precision=t.precision, scale=t.scale)
+    for predicates, factory in _SCALAR_SQL_TYPES:
+        if any(_is_type(t, predicate) for predicate in predicates):
+            return factory()
+    if any(_is_type(t, predicate) for predicate in _LIST_PREDICATES):
+        item = resolve_sql_type(t.value_type)
+        if isinstance(item, (types.NullType, types.ARRAY)):
+            return types.JSON()
+        return types.ARRAY(item)
+    if any(_is_type(t, predicate) for predicate in _NESTED_PREDICATES):
+        return types.JSON()
+    return types.NullType()
 
-    if pa.types.is_signed_integer(t) and not pa.types.is_int64(t):
-        return types.INTEGER
-    if pa.types.is_int64(t):
-        return types.BIGINT
 
-    # TODO(brett): Find a way to deal with unsigned integers.
-    if pa.types.is_unsigned_integer(t) and not pa.types.is_uint64(t):
-        return types.INTEGER
-    if pa.types.is_uint64(t):
-        return types.BIGINT
+def _is_type(t: pa.DataType, predicate: str) -> bool:
+    # Some predicates (view types) are newer than the supported PyArrow floor.
+    check = getattr(pa.types, predicate, None)
+    return bool(check is not None and check(t))
 
-    # TODO(brett): I'd like to be permissive of unknown types here, but I'm not
-    # sure what type we should fall back to.
-    return types.BLOB
+
+def build_parameter_record(values: ExecuteParams, parameter_schema: Optional[pa.Schema]) -> pa.RecordBatch:
+    """Bind qmark parameters for a prepared statement.
+
+    When the server returns a ``parameter_schema`` for the prepared statement,
+    the binding batch uses exactly that schema (field names and types), which
+    is what Flight SQL servers such as DataFusion's validate against. Servers
+    that return no parameter schema receive the legacy one-dense-union-per-
+    parameter batch.
+    """
+    if parameter_schema is None or len(parameter_schema) != len(values) or len(values) == 0:
+        return ParameterRecordBuilder(values).build_record()
+    arrays = []
+    for value, field in zip(values, parameter_schema):
+        try:
+            arrays.append(pa.array([value], type=field.type))
+        except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, OverflowError) as error:
+            raise DataError(
+                f"cannot bind {type(value).__name__} value to parameter {field.name!r} of type {field.type}"
+            ) from error
+    # Servers may declare parameter fields non-nullable even though SQL NULL is
+    # a valid bind (e.g. IS NOT DISTINCT FROM ?); keep names/types, allow NULL.
+    schema = pa.schema([field.with_nullable(True) for field in parameter_schema], metadata=parameter_schema.metadata)
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
 class ParameterRecordBuilder:

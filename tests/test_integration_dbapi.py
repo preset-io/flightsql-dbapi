@@ -1,5 +1,4 @@
 import pytest
-import sqlalchemy.sql.sqltypes as sqltypes
 
 import flightsql.flightsql_pb2 as flightsql_pb2
 from flightsql.dbapi import connect
@@ -27,12 +26,13 @@ def test_integration_query():
     cursor = conn.cursor()
     cursor.execute("select * from intTable")
 
-    assert cursor.description == [
-        ("id", sqltypes.BIGINT),
-        ("keyName", sqltypes.TEXT),
-        ("value", sqltypes.BIGINT),
-        ("foreignId", sqltypes.BIGINT),
+    assert [(d[0], repr(d[1])) for d in cursor.description] == [
+        ("id", "BIGINT()"),
+        ("keyName", "VARCHAR()"),
+        ("value", "BIGINT()"),
+        ("foreignId", "BIGINT()"),
     ]
+    assert all(len(d) == 7 for d in cursor.description)
     rows = [r for r in cursor]
     assert rows == [
         [1, "one", 1, 1],
@@ -93,32 +93,32 @@ def test_integration_sql_info():
 @pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)
 def test_integration_get_columns():
     conn = new_conn()
-    columns = conn.flightsql_get_columns("intTable", None)
+    columns = [{**c, "type": repr(c["type"])} for c in conn.flightsql_get_columns("intTable", None)]
     assert columns == [
         {
             "name": "id",
-            "type": sqltypes.BIGINT,
+            "type": "BIGINT()",
             "default": None,
             "comment": None,
             "nullable": False,
         },
         {
             "name": "keyName",
-            "type": sqltypes.TEXT,
+            "type": "VARCHAR()",
             "default": None,
             "comment": None,
             "nullable": False,
         },
         {
             "name": "value",
-            "type": sqltypes.BIGINT,
+            "type": "BIGINT()",
             "default": None,
             "comment": None,
             "nullable": False,
         },
         {
             "name": "foreignId",
-            "type": sqltypes.BIGINT,
+            "type": "BIGINT()",
             "default": None,
             "comment": None,
             "nullable": False,

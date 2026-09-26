@@ -1,18 +1,23 @@
+import datetime
 import inspect
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, MutableMapping, Sequence, Tuple
 
+import sqlalchemy
 from sqlalchemy import exc, pool
 from sqlalchemy.dialects import registry
 from sqlalchemy.engine import URL, default, reflection
-from sqlalchemy.sql import compiler, elements
+from sqlalchemy.sql import compiler, elements, sqltypes
 
 import flightsql.flightsql_pb2 as flightsql
 from flightsql.client import FlightSQLClient
 from flightsql.dbapi import TableMetadataResult
+from flightsql.exceptions import NotSupportedError, OperationalError
 
 feature_prefix = "feature-"
+
+_SQLALCHEMY_2 = int(sqlalchemy.__version__.split(".", 1)[0]) >= 2
 
 FEATURE_PREPARED_STATEMENTS = "sqlalchemy-prepared-statements"
 FEATURE_PRIMARY_KEYS = "sqlalchemy-primary-keys"
@@ -48,6 +53,10 @@ def _reflection_warning_stacklevel() -> int:
         # Frame objects retain locals; release them after this rare warning.
         del stack
     return 2
+
+
+def _is_view_type(table_type) -> bool:
+    return isinstance(table_type, str) and table_type.strip().upper() == "VIEW"
 
 
 def _import_flightsql_dbapi(_dialect_cls):
@@ -118,6 +127,8 @@ class FlightSQLDialect(default.DefaultDialect):
 
     driver = "flightsql"
     sql_info: Dict[int, Any] = {}
+    # Used when the server does not report SQL_IDENTIFIER_QUOTE_CHAR.
+    default_identifier_quote = '"'
 
     sql_info_values = [
         flightsql.FLIGHT_SQL_SERVER_NAME,
@@ -164,19 +175,35 @@ class FlightSQLDialect(default.DefaultDialect):
     def initialize(self, connection):
         super().initialize(connection)
 
-        self.sql_info = connection.connection.flightsql_get_sql_info(self.sql_info_values)
+        try:
+            self.sql_info = connection.connection.flightsql_get_sql_info(self.sql_info_values)
+        except NotSupportedError:
+            # GetSqlInfo is optional in practice: the DataFusion Flight SQL
+            # service answers UNIMPLEMENTED. Fall back to the dialect defaults
+            # instead of failing every connection.
+            self.sql_info = {}
 
         # Set the quote character for identifiers.
-        self.identifier_preparer.initial_quote = self.sql_info[flightsql.SQL_IDENTIFIER_QUOTE_CHAR]
-        self.identifier_preparer.final_quote = self.identifier_preparer.initial_quote
+        quote = self.sql_info.get(flightsql.SQL_IDENTIFIER_QUOTE_CHAR) or self.default_identifier_quote
+        self.identifier_preparer.initial_quote = quote
+        self.identifier_preparer.final_quote = quote
 
-        read_only = self.sql_info[flightsql.FLIGHT_SQL_SERVER_READ_ONLY]
-        self.supports_delete = not read_only
-        self.supports_alter = not read_only
+        read_only = self.sql_info.get(flightsql.FLIGHT_SQL_SERVER_READ_ONLY)
+        if read_only is not None:
+            self.supports_delete = not read_only
+            self.supports_alter = not read_only
 
     def create_connect_args(self, url: URL) -> Tuple[Sequence[Any], MutableMapping[str, Any]]:
         client = client_from_url(url)
-        return [client], {}
+        # The URL database component names the Flight SQL catalog that scopes
+        # reflection, e.g. datafusion://host:port/datafusion.
+        return [client], ({"catalog": url.database} if url.database else {})
+
+    def is_disconnect(self, e, connection, cursor):
+        if isinstance(e, OperationalError):
+            text = str(e).lower()
+            return "unavailable" in text or "connection" in text or "socket closed" in text
+        return False
 
     @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kwargs):
@@ -191,7 +218,25 @@ class FlightSQLDialect(default.DefaultDialect):
 
     @reflection.cache
     def get_table_names(self, connection, schema=None, **kwargs):
-        info_cache = kwargs.get("info_cache")
+        names, table_types = self._relation_names(connection, schema, kwargs.get("info_cache"))
+        return [name for name in names if not _is_view_type(table_types.get(name))]
+
+    @reflection.cache
+    def get_view_names(self, connection, schema=None, **kwargs):
+        names, table_types = self._relation_names(connection, schema, kwargs.get("info_cache"))
+        return [name for name in names if _is_view_type(table_types.get(name))]
+
+    def _relation_names(self, connection, schema, info_cache):
+        """Return every GetTables name (tables and views) and its table_type."""
+        key = (_TABLE_METADATA_CACHE_NAMESPACE, "relations", schema)
+        if info_cache is not None and key in info_cache:
+            return info_cache[key]
+        result = self._relation_names_uncached(connection, schema, info_cache)
+        if info_cache is not None:
+            info_cache[key] = result
+        return result
+
+    def _relation_names_uncached(self, connection, schema, info_cache):
         result = connection.connection.flightsql_get_table_metadata(schema)
         if not isinstance(result, TableMetadataResult):
             # Keep the documented dialect extension point tolerant of DB API
@@ -209,9 +254,10 @@ class FlightSQLDialect(default.DefaultDialect):
         for table_name, columns in columns_by_name.items():
             self._cache_table_columns(info_cache, schema, table_name, columns)
 
+        table_types = result.table_types or {}
         unresolved = [name for name in dict.fromkeys(result.table_names) if name not in columns_by_name]
         if not unresolved and result.included_schema_supported:
-            return list(dict.fromkeys(result.table_names))
+            return list(dict.fromkeys(result.table_names)), table_types
 
         names = [name for name in dict.fromkeys(result.table_names) if name in columns_by_name]
         recovered = 0
@@ -238,7 +284,7 @@ class FlightSQLDialect(default.DefaultDialect):
                 unreflectable=unreflectable,
                 stale=stale,
             )
-        return names
+        return names, table_types
 
     @staticmethod
     def _column_cache_key(schema, table_name):
@@ -310,11 +356,9 @@ class FlightSQLDialect(default.DefaultDialect):
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kwargs):
-        return table_name in self.get_table_names(
-            connection,
-            schema=schema,
-            info_cache=kwargs.get("info_cache"),
-        )
+        # SQLAlchemy 2 defines has_table() as true for views as well.
+        names, _table_types = self._relation_names(connection, schema, kwargs.get("info_cache"))
+        return table_name in names
 
     def get_indexes(self, connection, table_name, schema=None, **kwargs):
         return []
@@ -332,9 +376,6 @@ class FlightSQLDialect(default.DefaultDialect):
         return {"constrained_columns": names, "name": columns[0]["key_name"]}
 
     def get_foreign_keys(self, connection, table_name, schema=None, **kwargs):
-        return []
-
-    def get_view_names(self, connection, schema=None, **kwargs):
         return []
 
 
@@ -397,6 +438,24 @@ class LiteralBindCompiler(compiler.SQLCompiler):
         # the string "NULL" from a type processor.
         if value is None and not type_.should_evaluate_none:
             return self.process(elements.Null._instance())
+        if type_._isnull:
+            # Untyped binds (e.g. text(":v")) are typed from the Python value
+            # with SQLAlchemy's own literal resolver. Values it cannot map stay
+            # NullType and still fail closed below.
+            type_ = sqltypes._resolve_value_to_type(value)
+        # Typed temporal/binary literals: a quoted string would be compared or
+        # returned as text rather than as the SQL type.
+        if isinstance(value, datetime.datetime) and type_._type_affinity is sqltypes.DateTime:
+            return f"TIMESTAMP '{value.isoformat(sep=' ')}'"
+        if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
+            if type_._type_affinity is sqltypes.Date:
+                return f"DATE '{value.isoformat()}'"
+        if isinstance(value, datetime.time) and type_._type_affinity is sqltypes.Time:
+            if value.tzinfo is not None:
+                raise exc.CompileError("time zone aware time literals are not supported")
+            return f"TIME '{value.isoformat()}'"
+        if isinstance(value, (bytes, bytearray, memoryview)) and type_._type_affinity is sqltypes._Binary:
+            return f"X'{bytes(value).hex()}'"
         return super().render_literal_value(value, type_)
 
 
@@ -414,6 +473,21 @@ class DataFusionDialect(FlightSQLDialect):
     name = "datafusion"
 
     paramstyle = "qmark"
+
+    def create_connect_args(self, url: URL) -> Tuple[Sequence[Any], MutableMapping[str, Any]]:
+        args, kwargs = super().create_connect_args(url)
+        # DataFusion binds numbered placeholders ($1, $2, ...); every bare "?"
+        # is one and the same placeholder to it, so a prepared statement with
+        # two differently typed "?" binds fails to prepare. Only the opt-in
+        # prepared-statement compiler emits placeholders, so switch only that
+        # path. The default literal-bind path keeps qmark: under numeric
+        # paramstyles SQLAlchemy re-scans the post-compiled statement for
+        # %(name)s, which would corrupt literal values containing that text.
+        if args[0].features.get(FEATURE_PREPARED_STATEMENTS) == "on" and _SQLALCHEMY_2:
+            self.paramstyle = "numeric_dollar"
+            self.positional = True
+        return args, kwargs
+
     poolclass = pool.SingletonThreadPool
     returns_unicode_strings = True
     supports_default_values = False

@@ -22,6 +22,7 @@ import flightsql.flightsql_pb2 as flightsql
 from flightsql.sqlalchemy import FEATURE_PREPARED_STATEMENTS, LiteralBindCompiler
 
 from . import integration
+from .sqlalchemy_compat import with_bind_values
 
 
 def new_sqlalchemy_engine(features=None):
@@ -143,14 +144,14 @@ def test_integration_literal_binds_compile_string_is_directly_executable_and_esc
     statement = select(table.c.id).where(table.c["keyName"] == candidate).order_by(table.c.id)
 
     with engine.connect() as connection:
-        compiled = statement.params(candidate="one").compile(
+        compiled = with_bind_values(statement, candidate="one").compile(
             dialect=engine.dialect,
             compile_kwargs={"literal_binds": True},
         )
         assert "POSTCOMPILE" not in str(compiled)
         assert [row[0] for row in connection.exec_driver_sql(str(compiled))] == [1]
 
-        hostile = statement.params(candidate="one' OR 1=1 --").compile(
+        hostile = with_bind_values(statement, candidate="one' OR 1=1 --").compile(
             dialect=engine.dialect,
             compile_kwargs={"literal_binds": True},
         )
@@ -193,7 +194,7 @@ def test_integration_none_typed_binds_execute_as_sql_null_in_normal_and_literal_
 
     with engine.connect() as connection:
         assert [row[0] for row in connection.execute(statement, {"candidate": None})] == expected_ids
-        literal = statement.params(candidate=None).compile(
+        literal = with_bind_values(statement, candidate=None).compile(
             dialect=engine.dialect,
             compile_kwargs={"literal_binds": True},
         )

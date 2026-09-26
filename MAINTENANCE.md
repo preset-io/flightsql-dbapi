@@ -59,8 +59,12 @@ repeated-bind cache regression. The fork additionally bypasses a 1.4.6 compiler
 assertion for empty tuple-valued expanding binds and covers empty/nonempty cache
 reuse. The dialect does not claim compatibility with 1.4.0–1.4.5.
 
-The non-prepared compiler requires a concrete SQLAlchemy type for every
-non-NULL literal value; untyped non-NULL binds are rejected. A `None` value is
+The non-prepared compiler renders every bind as a literal. An untyped bind
+(for example `text(":v")`) is typed from its Python value with SQLAlchemy's own
+literal resolver (str, int, float, Decimal, bool, date/datetime/time, bytes);
+a value that resolver cannot map stays untyped and is rejected. Temporal and
+binary values render as typed SQL literals (`TIMESTAMP '...'`, `DATE '...'`,
+`TIME '...'`, `X'...'`) rather than quoted strings. A `None` value is
 handled separately by the compiler and emitted as SQL `NULL` for String,
 Integer, and NullType binds on both declared SQLAlchemy floors. A type that opts
 into `should_evaluate_none` retains its own literal processor. SQLAlchemy
@@ -70,10 +74,55 @@ rather than a true bulk parameter batch.
 
 The bundled SQLite Flight SQL reference server proves the DB API transport,
 reflection contracts, literal/prepared compiler paths, and installed-wheel
-entry point. It does **not** certify production InfluxDB/IOx or DataFusion
-semantics, real TLS certificate validation, or live Basic/Bearer authentication.
-Changes in those areas require bounded unit coverage here and a staging smoke
-test by the consuming service before its pin moves.
+entry point. It does **not** certify production InfluxDB/IOx semantics or live
+Basic authentication. Changes in those areas require bounded unit coverage here
+and a staging smoke test by the consuming service before its pin moves.
+
+### DataFusion Flight SQL service compatibility
+
+`0.2.2.2` was qualified live against a local server built on
+[`datafusion-flight-sql-server`](https://github.com/datafusion-contrib/datafusion-flight-sql-server)
+0.4.19 (DataFusion 55.1), including verified TLS with a private CA and bearer
+authentication. That service differs from the reference server in ways the
+client now handles, each covered by `tests/test_datafusion_server_compat.py`:
+
+- **GetSqlInfo is unimplemented.** Dialect initialization falls back to the
+  `"` identifier quote and the default read/write capability flags instead of
+  failing every connection.
+- **Metadata is catalog-scoped.** GetDbSchemas/GetTables with no catalog return
+  zero rows instead of every catalog. A catalog named in the URL
+  (`datafusion://host:port/<catalog>`) scopes every metadata RPC. Without one,
+  an unscoped empty answer triggers one GetCatalogs lookup per connection
+  (`datafusion` if present, else the only catalog) and a scoped retry. Servers
+  that answer unscoped requests never pay for the extra RPC.
+- **Views are reported with `table_type = VIEW`.** `get_table_names()` excludes
+  them, `get_view_names()` lists them, and `has_table()` covers both.
+- **Strings arrive as Utf8View.** Arrow string, binary and list view types map
+  to SQL types instead of an untyped blob. Reflected and described types are
+  type instances carrying decimal precision/scale, timestamp time zone
+  awareness and list element types; unsigned 64-bit integers reflect as
+  `NUMERIC(20, 0)`. Cursor descriptions are PEP 249 seven-item tuples.
+- **Prepared statements.** The server returns a typed `parameter_schema`, binds
+  numbered placeholders (`$1`, `$2`; every bare `?` is the same placeholder to
+  it), and returns the bound handle from DoPut as a
+  `DoPutPreparedStatementResult`. The client binds against the returned schema
+  (nullable, so `NULL` binds work), executes the returned handle, and the
+  opt-in prepared-statement feature renders `$n` placeholders on SQLAlchemy 2.
+  The default literal path keeps qmark: SQLAlchemy's numeric paramstyles
+  rescan the post-compiled statement for `%(name)s`, which would corrupt
+  literal values containing that text. The server cannot type a placeholder
+  that has no column context (`SELECT $1`); that is a server-side limit.
+- **Errors.** PyArrow/Flight failures are re-raised as PEP 249 exceptions
+  (`OperationalError` for unavailable/unauthenticated, `NotSupportedError` for
+  unimplemented, `ProgrammingError`/`InternalError`/`DatabaseError` otherwise)
+  with the original chained, so SQLAlchemy wraps them and pool pre-ping
+  recycles connections after a server restart.
+- **No placeholder credentials.** Without a token or user/password no
+  `authorization` header is sent (previously `Bearer None`).
+
+Writes (DoPut CommandStatementUpdate), transactions and key reflection
+(GetPrimaryKeys) are unimplemented by that service and remain unsupported
+through it.
 
 Reflection treats a successful zero-row GetTables result as an empty catalog.
 If reported names exceed parseable included schemas, only the missing table keys
@@ -113,9 +162,9 @@ artifact URL together with its SHA-256. A PEP 508 direct reference to
 supported where a source pin is required instead.
 
 1. Record the internal fork version in `pyproject.toml` and
-   `flightsql/__init__.py` (currently `0.2.2.1`). Published artifacts are
+   `flightsql/__init__.py` (currently `0.2.2.2`). Published artifacts are
    immutable and are never rebuilt in place, so any subsequent change ships as
-   a new fourth component (`0.2.2.2`, and so on). The pipeline refuses to
+   a new fourth component (`0.2.2.3`, and so on). The pipeline refuses to
    overwrite an existing key rather than relying on this being remembered.
 2. Run the installed-wheel matrix and the reference-server suite, and merge the
    reviewed, green version change.

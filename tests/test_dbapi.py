@@ -58,11 +58,20 @@ def test_dbapi_results():
         [23, 7, 2000, "jake"],
         [28, 1, 1995, "jerry"],
     ]
-    assert descriptions == [
-        ("days", sqltypes.INTEGER),
-        ("months", sqltypes.INTEGER),
-        ("years", sqltypes.INTEGER),
-        ("names", sqltypes.TEXT),
+    # PEP 249 seven-item descriptions.
+    assert [(d[0], repr(d[1]), *d[2:]) for d in descriptions] == [
+        ("days", "SMALLINT()", None, None, None, None, True),
+        ("months", "SMALLINT()", None, None, None, None, True),
+        ("years", "SMALLINT()", None, None, None, None, True),
+        ("names", "VARCHAR()", None, None, None, None, True),
+    ]
+
+
+def test_description_reports_decimal_precision_scale_and_nullability():
+    schema = pa.schema([pa.field("amount", pa.decimal128(12, 2), nullable=False)])
+    _, descriptions = dbapi_results(schema.empty_table())
+    assert [(d[0], repr(d[1]), *d[2:]) for d in descriptions] == [
+        ("amount", "DECIMAL(precision=12, scale=2)", None, None, 12, 2, False)
     ]
 
 
@@ -177,7 +186,7 @@ def test_dbapi_results_returns_stdlib_durations_at_microsecond_precision(unit, r
 
     assert values == [[expected], [None]]
     assert type(values[0][0]) is timedelta
-    assert descriptions == [("value", sqltypes.Interval)]
+    assert [(d[0], repr(d[1])) for d in descriptions] == [("value", "Interval()")]
 
 
 def test_dbapi_results_returns_decimal_values_without_float_conversion():
@@ -419,6 +428,9 @@ def test_get_columns_returns_empty_result_for_unknown_table():
             return table
 
     class Client:
+        def get_catalogs(self):
+            raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
+
         def get_tables(self, **kwargs):
             return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
 
@@ -461,6 +473,9 @@ def test_get_table_metadata_uses_one_included_schema_request_and_marks_partial_r
         def __init__(self):
             self.calls = []
 
+        def get_catalogs(self):
+            raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
+
         def get_tables(self, **kwargs):
             self.calls.append(("get_tables", kwargs))
             return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
@@ -472,21 +487,13 @@ def test_get_table_metadata_uses_one_included_schema_request_and_marks_partial_r
     client = Client()
     connection = Connection(client)
 
-    assert connection.flightsql_get_table_metadata("public") == TableMetadataResult(
-        ["alpha", "stale", "malformed"],
-        {
-            "alpha": [
-                {
-                    "name": "id",
-                    "type": sqltypes.BIGINT,
-                    "default": None,
-                    "comment": None,
-                    "nullable": False,
-                }
-            ]
-        },
-        False,
-    )
+    result = connection.flightsql_get_table_metadata("public")
+    assert result.table_names == ["alpha", "stale", "malformed"]
+    assert result.included_schema_supported is False
+    assert list(result.columns_by_name) == ["alpha"]
+    [column] = result.columns_by_name["alpha"]
+    assert isinstance(column.pop("type"), sqltypes.BIGINT)
+    assert column == {"name": "id", "default": None, "comment": None, "nullable": False}
     assert client.calls == [
         ("get_tables", {"db_schema_filter_pattern": "public", "include_schema": True}),
         ("do_get", b"ticket"),
@@ -513,6 +520,9 @@ def test_table_metadata_filters_and_keys_same_table_name_by_requested_schema():
             return table
 
     class Client:
+        def get_catalogs(self):
+            raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
+
         def get_tables(self, **kwargs):
             return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
 
@@ -544,6 +554,9 @@ def test_table_metadata_rejects_missing_table_name_column_explicitly(table):
             return table
 
     class Client:
+        def get_catalogs(self):
+            raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
+
         def get_tables(self, **kwargs):
             return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
 
@@ -573,6 +586,9 @@ def test_table_metadata_rejects_missing_table_name_column_explicitly(table):
 )
 def test_table_metadata_rejects_malformed_response_shapes_explicitly(info, reader, message):
     class Client:
+        def get_catalogs(self):
+            raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
+
         def get_tables(self, **kwargs):
             return info
 
@@ -600,6 +616,9 @@ def test_get_table_metadata_distinguishes_names_only_response_from_empty_catalog
             self.names_table = names_table if names_table is not None else included_schema_table
             self.requested_include_schema = True
 
+        def get_catalogs(self):
+            raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
+
         def get_tables(self, **kwargs):
             self.requested_include_schema = kwargs.get("include_schema", False)
             return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
@@ -620,6 +639,9 @@ def test_get_table_metadata_distinguishes_names_only_response_from_empty_catalog
 
 def test_get_table_metadata_does_not_mask_transport_errors():
     class Client:
+        def get_catalogs(self):
+            raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
+
         def get_tables(self, **kwargs):
             return SimpleNamespace(endpoints=[SimpleNamespace(ticket=b"ticket")])
 
@@ -636,6 +658,9 @@ def test_empty_included_schema_response_does_not_mask_names_rpc_errors():
             return pa.table({"table_name": pa.array([], type=pa.string())})
 
     class Client:
+        def get_catalogs(self):
+            raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
+
         def get_tables(self, **kwargs):
             if not kwargs.get("include_schema", False):
                 raise RuntimeError("names transport unavailable")
@@ -648,27 +673,51 @@ def test_empty_included_schema_response_does_not_mask_names_rpc_errors():
         Connection(Client()).flightsql_get_table_metadata()
 
 
+# DOUBLE_PRECISION exists from SQLAlchemy 2.0; 1.4 resolves to FLOAT(53).
+DOUBLE_REPR = "DOUBLE_PRECISION()" if hasattr(sqltypes, "DOUBLE_PRECISION") else "Float(precision=53)"
+
+
 def test_resolve_sql_type():
+    # Instances, not classes: reflected types must render as SQL type names and
+    # keep their parameters (decimal precision/scale, timezone, list items).
     cases = [
-        (pa.timestamp("ns"), sqltypes.TIMESTAMP),
-        (pa.time64("ns"), sqltypes.TIME),
-        (pa.date64(), sqltypes.DATE),
-        (pa.duration("ns"), sqltypes.Interval),
-        (pa.decimal128(10, 5), sqltypes.DECIMAL),
-        (pa.string(), sqltypes.TEXT),
-        (pa.utf8(), sqltypes.TEXT),
-        (pa.float32(), sqltypes.FLOAT),
-        (pa.float64(), sqltypes.FLOAT),
-        (pa.int8(), sqltypes.INTEGER),
-        (pa.int16(), sqltypes.INTEGER),
-        (pa.int32(), sqltypes.INTEGER),
-        (pa.int64(), sqltypes.BIGINT),
-        (pa.uint8(), sqltypes.INTEGER),
-        (pa.uint16(), sqltypes.INTEGER),
-        (pa.uint32(), sqltypes.INTEGER),
-        (pa.uint64(), sqltypes.BIGINT),
-        (pa.bool_(), sqltypes.BOOLEAN),
-        (pa.binary(), sqltypes.BINARY),
+        (pa.timestamp("ns"), "TIMESTAMP()"),
+        (pa.timestamp("us", tz="UTC"), "TIMESTAMP(timezone=True)"),
+        (pa.time64("ns"), "TIME()"),
+        (pa.date64(), "DATE()"),
+        (pa.duration("ns"), "Interval()"),
+        (pa.decimal128(10, 5), "DECIMAL(precision=10, scale=5)"),
+        (pa.decimal256(76, 0), "DECIMAL(precision=76, scale=0)"),
+        (pa.string(), "VARCHAR()"),
+        (pa.utf8(), "VARCHAR()"),
+        (pa.large_string(), "VARCHAR()"),
+        (pa.dictionary(pa.int32(), pa.string()), "VARCHAR()"),
+        (pa.float16(), "REAL()"),
+        (pa.float32(), "REAL()"),
+        (pa.float64(), DOUBLE_REPR),
+        (pa.int8(), "SMALLINT()"),
+        (pa.int16(), "SMALLINT()"),
+        (pa.int32(), "INTEGER()"),
+        (pa.int64(), "BIGINT()"),
+        (pa.uint8(), "SMALLINT()"),
+        (pa.uint16(), "INTEGER()"),
+        (pa.uint32(), "BIGINT()"),
+        (pa.uint64(), "NUMERIC(precision=20, scale=0)"),
+        (pa.bool_(), "BOOLEAN()"),
+        (pa.binary(), "VARBINARY()"),
+        (pa.large_binary(), "VARBINARY()"),
+        (pa.binary(4), "VARBINARY()"),
+        (pa.list_(pa.int64()), "ARRAY(BIGINT())"),
+        (pa.list_(pa.list_(pa.int64())), "JSON()"),
+        (pa.struct([("a", pa.int64())]), "JSON()"),
+        (pa.map_(pa.string(), pa.int64()), "JSON()"),
+        (pa.null(), "NullType()"),
     ]
+    for view_type, name in (("string_view", "VARCHAR()"), ("binary_view", "VARBINARY()")):
+        factory = getattr(pa, view_type, None)
+        if factory is not None:
+            cases.append((factory(), name))
     for actual, expected in cases:
-        assert resolve_sql_type(actual) == expected
+        resolved = resolve_sql_type(actual)
+        assert isinstance(resolved, sqltypes.TypeEngine), actual
+        assert repr(resolved) == expected, actual
