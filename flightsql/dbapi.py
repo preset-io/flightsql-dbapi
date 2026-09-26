@@ -754,6 +754,9 @@ def arrow_column_descriptions(schema: pa.Schema) -> List[Tuple[Any, ...]]:
     return description
 
 
+# DOUBLE_PRECISION is SQLAlchemy 2.0+; FLOAT(53) is the same IEEE double on 1.4.
+_DOUBLE = getattr(types, "DOUBLE_PRECISION", None) or (lambda: types.Float(precision=53))
+
 # Scalar Arrow type predicates in resolution order, each with a SQL type factory.
 _SCALAR_SQL_TYPES: List[Tuple[Tuple[str, ...], Any]] = [
     (("is_time",), types.TIME),
@@ -761,7 +764,7 @@ _SCALAR_SQL_TYPES: List[Tuple[Tuple[str, ...], Any]] = [
     (("is_boolean",), types.BOOLEAN),
     (("is_duration", "is_interval"), types.Interval),
     (("is_float16", "is_float32"), types.REAL),
-    (("is_floating",), types.DOUBLE_PRECISION),
+    (("is_floating",), _DOUBLE),
     (("is_string", "is_large_string", "is_string_view"), types.VARCHAR),
     (("is_binary", "is_large_binary", "is_fixed_size_binary", "is_binary_view"), types.VARBINARY),
     (("is_int8", "is_int16", "is_uint8"), types.SMALLINT),

@@ -120,7 +120,8 @@ def test_url_database_names_the_catalog():
     dialect = DataFusionDialect()
     _, kwargs = dialect.create_connect_args(make_url("datafusion://localhost:50051/analytics?insecure=true"))
     assert kwargs == {"catalog": "analytics"}
-    _, kwargs = dialect.create_connect_args(make_url("datafusion://localhost:50051?insecure=true"))
+    # "/?" rather than "?": SQLAlchemy 1.4.6 cannot parse a query string with no path.
+    _, kwargs = dialect.create_connect_args(make_url("datafusion://localhost:50051/?insecure=true"))
     assert kwargs == {}
 
 

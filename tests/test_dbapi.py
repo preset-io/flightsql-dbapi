@@ -673,6 +673,10 @@ def test_empty_included_schema_response_does_not_mask_names_rpc_errors():
         Connection(Client()).flightsql_get_table_metadata()
 
 
+# DOUBLE_PRECISION exists from SQLAlchemy 2.0; 1.4 resolves to FLOAT(53).
+DOUBLE_REPR = "DOUBLE_PRECISION()" if hasattr(sqltypes, "DOUBLE_PRECISION") else "Float(precision=53)"
+
+
 def test_resolve_sql_type():
     # Instances, not classes: reflected types must render as SQL type names and
     # keep their parameters (decimal precision/scale, timezone, list items).
@@ -690,7 +694,7 @@ def test_resolve_sql_type():
         (pa.dictionary(pa.int32(), pa.string()), "VARCHAR()"),
         (pa.float16(), "REAL()"),
         (pa.float32(), "REAL()"),
-        (pa.float64(), "DOUBLE_PRECISION()"),
+        (pa.float64(), DOUBLE_REPR),
         (pa.int8(), "SMALLINT()"),
         (pa.int16(), "SMALLINT()"),
         (pa.int32(), "INTEGER()"),

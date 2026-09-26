@@ -35,6 +35,8 @@ from flightsql.sqlalchemy import (
     client_from_url,
 )
 
+from .sqlalchemy_compat import with_bind_values
+
 CUSTOM_DBAPI = SimpleNamespace(paramstyle="qmark")
 LEGACY_DBAPI = SimpleNamespace(paramstyle="qmark")
 
@@ -626,7 +628,9 @@ def test_literal_binds_compilation_stays_fully_literal():
     repeated = bindparam("candidate", type_=Integer, literal_execute=True)
     statement = select(records.c.id).where((records.c.id == repeated) | (records.c.id == repeated))
 
-    compiled = statement.params(candidate=7).compile(dialect=_literal_dialect(), compile_kwargs={"literal_binds": True})
+    compiled = with_bind_values(statement, candidate=7).compile(
+        dialect=_literal_dialect(), compile_kwargs={"literal_binds": True}
+    )
 
     assert "POSTCOMPILE" not in str(compiled)
     assert str(compiled).count("records.id = 7") == 2
@@ -697,7 +701,7 @@ def test_none_postcompile_and_literal_binds_render_sql_null_for_all_declared_sql
 
     compiled = statement.compile(dialect=_literal_dialect())
     expanded = compiled._process_parameters_for_postcompile({"candidate": None})
-    literal = statement.params(candidate=None).compile(
+    literal = with_bind_values(statement, candidate=None).compile(
         dialect=_literal_dialect(),
         compile_kwargs={"literal_binds": True},
     )
