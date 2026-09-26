@@ -48,22 +48,22 @@
 // Four-component convention already used in this bucket (upstream PyHive
 // 0.7.0 -> Preset 0.7.0.1, Exasol 7.1.3.1, Drill 1.1.11.1, pinotdb 9.1.2.1).
 // Upstream's last public PyPI release is 0.2.2, so the Preset build is
-// 0.2.2.1, declared in pyproject.toml so the published version is auditable in
+// 0.2.2.2, declared in pyproject.toml so the published version is auditable in
 // git rather than synthesised here.
 //
-//   * main        -> stable 0.2.2.1; build and verify on every push, publish
+//   * main        -> stable 0.2.2.2; build and verify on every push, publish
 //                    ONLY with PUBLISH_RELEASE=true after human release review.
-//   * PR branches -> 0.2.2.1+pr.<n>.<shortsha>, for build/install checks ONLY.
+//   * PR branches -> 0.2.2.2+pr.<n>.<shortsha>, for build/install checks ONLY.
 //                    No S3 access, credential binding or index publication.
-//                    Local versions match ==0.2.2.1 and sort above it, so
+//                    Local versions match ==0.2.2.2 and sort above it, so
 //                    immutable PR URLs in the shared index are NOT safe here.
 //
 // A four-component version is used rather than a PEP 440 local version such as
 // 0.2.3+preset.2 because a local version is MATCHED by the corresponding
 // public specifier: `==0.2.3` admits `0.2.3+preset.2`, so a resolver asked for
 // the public release can silently select the Preset build and vice versa.
-// `==0.2.2` does not admit 0.2.2.1.  Avoiding '+' also keeps the pinned URL
-// free of %2B encoding.  0.2.2.1 still sorts ABOVE upstream 0.2.2, so it must
+// `==0.2.2` does not admit 0.2.2.2.  Avoiding '+' also keeps the pinned URL
+// free of %2B encoding.  0.2.2.2 still sorts ABOVE upstream 0.2.2, so it must
 // never be offered to a resolver as a candidate for the plain
 // `flightsql-dbapi` name.  Consumers pin the immutable wheel URL directly.
 //

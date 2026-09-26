@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from packaging.version import Version
 
 _DISTRIBUTION = "flightsql-dbapi"
-_DEFAULT_VERSION = "0.2.2.1"
+_DEFAULT_VERSION = "0.2.2.2"
 _DEFAULT_REPOSITORY = "https://github.com/preset-io/flightsql-dbapi.git"
 _FULL_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")

@@ -710,7 +710,7 @@ def test_none_postcompile_and_literal_binds_render_sql_null_for_all_declared_sql
     assert "'NULL'" not in str(literal)
 
 
-def test_none_is_not_confused_with_the_string_null_and_untyped_non_null_values_fail_closed():
+def test_none_is_not_confused_with_the_string_null_and_unmappable_untyped_values_fail_closed():
     value_column = column("value", String())
     string_statement = select(value_column).where(value_column == bindparam("candidate", type_=String()))
     compiled = string_statement.compile(dialect=_literal_dialect())
@@ -721,10 +721,14 @@ def test_none_is_not_confused_with_the_string_null_and_untyped_non_null_values_f
     assert "value = NULL" in none_sql
     assert "value = 'NULL'" in string_sql
 
+    # Untyped binds (text(":v")) are typed from the Python value with
+    # SQLAlchemy's own resolver; values it cannot map still fail closed.
     untyped_statement = select(bindparam("candidate", type_=NullType()))
     untyped = untyped_statement.compile(dialect=_literal_dialect())
+    rendered = untyped._process_parameters_for_postcompile({"candidate": "it's typed"}).statement
+    assert "'it''s typed'" in rendered
     with pytest.raises(Exception, match=r"literal|render|quote"):
-        untyped._process_parameters_for_postcompile({"candidate": "not typed"})
+        untyped._process_parameters_for_postcompile({"candidate": object()})
 
 
 def test_literal_none_preserves_type_should_evaluate_none_opt_in():

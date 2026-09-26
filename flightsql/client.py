@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pyarrow as pa
+import pyarrow.ipc  # noqa: F401 - pa.ipc.read_schema
 from google.protobuf import any_pb2
 from pyarrow import flight
 from pyarrow.ipc import IpcReadOptions, IpcWriteOptions
@@ -79,7 +80,17 @@ class PreparedStatement:
             writer, reader = self.client.do_put(desc, binding.schema, self.options)
             writer.write(binding)
             writer.done_writing()
-            reader.read()
+            metadata = reader.read()
+            writer.close()
+            # Flight SQL servers may return DoPutPreparedStatementResult with a
+            # new handle that carries the bound parameters (the DataFusion
+            # service is stateless and does exactly this). Executing the
+            # original handle would run the statement without its parameters.
+            updated = _updated_prepared_handle(metadata.to_pybytes() if metadata is not None else b"")
+            if updated:
+                self.handle = updated
+                cmd = flightsql.CommandPreparedStatementQuery(prepared_statement_handle=updated)
+                desc = flight_descriptor(cmd)
 
         return self.client.get_flight_info(desc, self.options)
 
@@ -254,15 +265,10 @@ class FlightSQLClient:
         result = flightsql.ActionCreatePreparedStatementResult()
         result_wrap.Unpack(result)
 
-        if result.dataset_schema is not None:
-            # TODO(brett): Parse this and place into the PreparedStatement.
-            pass
-
-        if result.parameter_schema is not None:
-            # TODO(brett): Parse this and place into the PreparedStatement.
-            pass
-
-        return PreparedStatement(self.client, options, result.prepared_statement_handle)
+        stmt = PreparedStatement(self.client, options, result.prepared_statement_handle)
+        stmt.dataset_schema = _read_ipc_schema(result.dataset_schema)
+        stmt.parameter_schema = _read_ipc_schema(result.parameter_schema)
+        return stmt
 
     def get_table_types(self, call_options: Optional[FlightSQLCallOptions] = None):
         """
@@ -350,13 +356,82 @@ def create_flight_client(
     headers = []
     if user or password:
         headers.append(client.authenticate_basic_token(user, password))
-    else:
+    elif token:
         headers.append((b"authorization", f"Bearer {token}".encode("utf-8")))
 
     for k, v in (metadata or {}).items():
         headers.append((k.encode("utf-8"), v.encode("utf-8")))
 
     return client, headers
+
+
+def _protobuf_fields(payload: bytes) -> Optional[Dict[int, bytes]]:
+    """Decode the length-delimited fields of a protobuf message, or None."""
+
+    def varint(pos: int) -> Tuple[int, int]:
+        value = shift = 0
+        while True:
+            if pos >= len(payload) or shift > 63:
+                raise ValueError("truncated varint")
+            byte = payload[pos]
+            pos += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if not byte & 0x80:
+                return value, pos
+
+    fields: Dict[int, bytes] = {}
+    pos = 0
+    try:
+        while pos < len(payload):
+            key, pos = varint(pos)
+            number, wire_type = key >> 3, key & 0x07
+            if wire_type == 0:
+                _, pos = varint(pos)
+            elif wire_type == 2:
+                length, pos = varint(pos)
+                if pos + length > len(payload):
+                    return None
+                fields[number] = payload[pos : pos + length]
+                pos += length
+            elif wire_type == 1:
+                pos += 8
+            elif wire_type == 5:
+                pos += 4
+            else:
+                return None
+    except ValueError:
+        return None
+    return fields
+
+
+_DO_PUT_PREPARED_RESULT_URL = "type.googleapis.com/arrow.flight.protocol.sql.DoPutPreparedStatementResult"
+
+
+def _updated_prepared_handle(payload: bytes) -> Optional[bytes]:
+    """Return DoPutPreparedStatementResult.prepared_statement_handle, if any.
+
+    The message (field 1, optional bytes) postdates the bundled protobuf
+    module, so it is decoded directly; an ``Any`` wrapper is also accepted.
+    """
+    if not payload:
+        return None
+    fields = _protobuf_fields(payload)
+    if fields and fields.get(1) == _DO_PUT_PREPARED_RESULT_URL.encode() and 2 in fields:
+        fields = _protobuf_fields(fields[2])
+    if not fields:
+        return None
+    return fields.get(1) or None
+
+
+def _read_ipc_schema(serialized: bytes) -> Optional[pa.Schema]:
+    """Decode an optional IPC-serialized schema from a prepared statement result."""
+    if not serialized:
+        return None
+    try:
+        return pa.ipc.read_schema(pa.py_buffer(serialized))
+    except (pa.ArrowInvalid, OSError):
+        return None
 
 
 def flight_descriptor(command: Any) -> flight.FlightDescriptor:

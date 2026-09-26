@@ -40,7 +40,7 @@ abstract class PublicationPipelineStub extends Script {
         if (step.returnStatus) return scenario.exists ? 0 : 1
         if (step.returnStdout) {
             if (step.script.contains('rev-parse')) return 'abc1234\n'
-            if (step.label == 'Read declared version') return '0.2.2.1\n'
+            if (step.label == 'Read declared version') return '0.2.2.2\n'
             if (step.label == 'Record built digest') return ('d' * 64) + '\n'
             throw new AssertionError("Unexpected stdout command: ${step}")
         }
@@ -59,7 +59,7 @@ def cases = [
     [branch: 'PR-7', release: true], // A PR cannot opt into publication.
     [branch: 'main', changeId: '7', release: true], // CHANGE_ID also excludes main.
     [branch: 'feature/nope', release: true, failure: 'Refusing to build stable version'],
-    [branch: 'v0.2.2.1', release: true, failure: 'Refusing to build stable version'],
+    [branch: 'v0.2.2.2', release: true, failure: 'Refusing to build stable version'],
 ]
 int checkedShells = 0
 cases.each { scenario ->
@@ -84,7 +84,7 @@ cases.each { scenario ->
         assert script.credentialStages == ['Reject an already-published version', 'Publish wheel']
         def upload = script.shells.find { it.label == 'Upload wheel (no-overwrite)' }.script
         assert upload.contains('IfNoneMatch="*"')
-        assert upload.contains('KEY=\'flightsql-dbapi/flightsql_dbapi-0.2.2.1-py3-none-any.whl\'')
+        assert upload.contains('KEY=\'flightsql-dbapi/flightsql_dbapi-0.2.2.2-py3-none-any.whl\'')
         assert !upload.contains('+')
         assert script.shells.any { it.label == 'Digest the stored artifact' }
         assert script.archived*.artifacts == ['published.sha256']
@@ -98,7 +98,7 @@ cases.each { scenario ->
     }
     if (scenario.branch.startsWith('PR-') || scenario.changeId) {
         def install = script.shells.find { it.label == 'Install and inspect artifact' }.script
-        assert install.contains('0.2.2.1+')
+        assert install.contains('0.2.2.2+')
     }
     script.shells.each { step ->
         def process = new ProcessBuilder('bash', '-n').start()

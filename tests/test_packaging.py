@@ -41,7 +41,7 @@ def test_untrusted_installed_provenance_console_entrypoint_is_absent():
 def test_fork_has_non_pypi_release_identity():
     installed_version = Version(version("flightsql-dbapi"))
 
-    assert installed_version == Version("0.2.2.1")
+    assert installed_version == Version("0.2.2.2")
     assert installed_version.local is None
 
 
@@ -51,7 +51,7 @@ def test_fork_version_is_distinct_from_every_public_release():
     # is *matched* by the specifier ==0.2.3, so a resolver asked for the public
     # release can silently select the Preset build and vice versa.  A fourth
     # component is a distinct release that no public specifier admits.
-    fork = Version("0.2.2.1")
+    fork = Version("0.2.2.2")
     upstream = Version("0.2.2")
 
     assert fork not in SpecifierSet(f"=={upstream}")
