@@ -791,6 +791,19 @@ _LIST_PREDICATES = ("is_list", "is_large_list", "is_fixed_size_list", "is_list_v
 _NESTED_PREDICATES = ("is_struct", "is_map", "is_union")
 
 
+class ArrowNestedJSON(types.JSON):
+    """JSON type for struct, map and nested-list columns.
+
+    Arrow already returns these values as Python dicts and lists, so results
+    are passed through rather than decoded as JSON text.
+    """
+
+    cache_ok = True
+
+    def result_processor(self, dialect: Any, coltype: Any) -> None:
+        return None
+
+
 def resolve_sql_type(t: pa.DataType) -> types.TypeEngine:
     """Resolve an Arrow DataType to a SQLAlchemy type instance.
 
@@ -813,10 +826,10 @@ def resolve_sql_type(t: pa.DataType) -> types.TypeEngine:
     if any(_is_type(t, predicate) for predicate in _LIST_PREDICATES):
         item = resolve_sql_type(t.value_type)
         if isinstance(item, (types.NullType, types.ARRAY)):
-            return types.JSON()
+            return ArrowNestedJSON()
         return types.ARRAY(item)
     if any(_is_type(t, predicate) for predicate in _NESTED_PREDICATES):
-        return types.JSON()
+        return ArrowNestedJSON()
     return types.NullType()
 
 

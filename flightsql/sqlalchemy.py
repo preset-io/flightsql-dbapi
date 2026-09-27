@@ -121,10 +121,6 @@ def client_from_url(url: URL) -> FlightSQLClient:
     )
 
 
-def _passthrough(value: Any) -> Any:
-    return value
-
-
 class FlightSQLDialect(default.DefaultDialect):
     """
     Establishes baseline behavior of a FlightSQL Dialect. All other
@@ -136,9 +132,10 @@ class FlightSQLDialect(default.DefaultDialect):
     # Arrow already returns exact int/Decimal values; SQLAlchemy's non-native
     # Numeric processor would round them through float.
     supports_native_decimal = True
-    # Arrow returns struct/map/nested-list values as Python dicts and lists.
+    # JSON binds use SQLAlchemy's default json.dumps/json.loads; reflected
+    # nested columns use ArrowNestedJSON, which passes Arrow values through.
     _json_serializer = None
-    _json_deserializer = staticmethod(_passthrough)
+    _json_deserializer = None
     # Used when the server does not report SQL_IDENTIFIER_QUOTE_CHAR.
     default_identifier_quote = '"'
 

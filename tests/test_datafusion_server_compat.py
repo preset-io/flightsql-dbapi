@@ -333,9 +333,9 @@ def test_uint64_and_decimal_results_are_not_rounded_through_float():
 def test_nested_values_pass_through_the_json_type():
     dialect = DataFusionDialect()
     nested = flightsql.dbapi.resolve_sql_type(pa.struct([("a", pa.int64())]))
-    processor = nested.result_processor(dialect, None)
-    assert processor({"a": 1}) == {"a": 1}
-    assert processor(None) is None
+    assert isinstance(nested, sqltypes.JSON)
+    # No result processor: Arrow's dicts and lists are returned unchanged.
+    assert nested.result_processor(dialect, None) is None
 
 
 def test_any_wrapping_another_message_is_not_a_prepared_handle():

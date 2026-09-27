@@ -732,9 +732,9 @@ def test_resolve_sql_type():
         (pa.large_binary(), "VARBINARY()"),
         (pa.binary(4), "VARBINARY()"),
         (pa.list_(pa.int64()), "ARRAY(BIGINT())"),
-        (pa.list_(pa.list_(pa.int64())), "JSON()"),
-        (pa.struct([("a", pa.int64())]), "JSON()"),
-        (pa.map_(pa.string(), pa.int64()), "JSON()"),
+        (pa.list_(pa.list_(pa.int64())), "ArrowNestedJSON()"),
+        (pa.struct([("a", pa.int64())]), "ArrowNestedJSON()"),
+        (pa.map_(pa.string(), pa.int64()), "ArrowNestedJSON()"),
         (pa.null(), "NullType()"),
     ]
     for view_type, name in (("string_view", "VARCHAR()"), ("binary_view", "VARBINARY()")):
