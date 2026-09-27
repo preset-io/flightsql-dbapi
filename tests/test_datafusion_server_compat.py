@@ -320,11 +320,11 @@ def test_parameter_record_with_union_parameter_schema_uses_union_binding():
 
 def test_uint64_and_decimal_results_are_not_rounded_through_float():
     dialect = DataFusionDialect()
-    uint64 = flightsql.dbapi.resolve_sql_type(pa.uint64())
+    uint64 = flightsql.dbapi.resolve_sql_type(pa.uint64()).dialect_impl(dialect)
     processor = uint64.result_processor(dialect, None)
     value = 18446744073709551615
     assert (processor(value) if processor else value) == value
-    decimal = flightsql.dbapi.resolve_sql_type(pa.decimal128(38, 10))
+    decimal = flightsql.dbapi.resolve_sql_type(pa.decimal128(38, 10)).dialect_impl(dialect)
     processor = decimal.result_processor(dialect, None)
     exact = Decimal("1234567890123456789012345678.0123456789")
     assert (processor(exact) if processor else exact) == exact
@@ -371,3 +371,20 @@ def test_explicit_paramstyle_is_honored_with_prepared_statements():
         "datafusion://localhost:1?insecure=true&feature-sqlalchemy-prepared-statements=on", paramstyle="qmark"
     ).dialect
     assert dialect.paramstyle == "qmark"
+
+
+def _result(type_, value):
+    dialect = DataFusionDialect()
+    processor = type_.dialect_impl(dialect).result_processor(dialect, None)
+    return processor(value) if processor else value
+
+
+def test_numeric_over_a_double_column_still_returns_decimal():
+    assert _result(sqltypes.Numeric(10, 2), 1.1) == Decimal("1.10")
+    assert isinstance(_result(sqltypes.Numeric(10, 2), 1.1), Decimal)
+    exact = Decimal("12345678901234567890.0123456789")
+    assert _result(sqltypes.Numeric(38, 10), exact) is exact
+    assert _result(sqltypes.Numeric(20, 0), 18446744073709551615) == Decimal(18446744073709551615)
+    assert _result(sqltypes.Numeric(asdecimal=False), Decimal("1.5")) == 1.5
+    assert isinstance(_result(sqltypes.Float(), 1.5), float)
+    assert _result(sqltypes.Numeric(10, 2), None) is None

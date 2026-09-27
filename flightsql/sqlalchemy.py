@@ -1,4 +1,5 @@
 import datetime
+import decimal
 import inspect
 import math
 import warnings
@@ -121,6 +122,34 @@ def client_from_url(url: URL) -> FlightSQLClient:
     )
 
 
+class FlightSQLNumeric(sqltypes.Numeric):
+    """Numeric that stays a Decimal whatever Arrow type the column has.
+
+    With native decimals SQLAlchemy returns the driver value unchanged, which
+    would turn ``Numeric`` over a DOUBLE/REAL column into ``float``. Decimal
+    values pass through, integers convert exactly, and floats convert as
+    SQLAlchemy's non-native processor does.
+    """
+
+    cache_ok = True
+
+    def result_processor(self, dialect, coltype):
+        if not self.asdecimal:
+            return super().result_processor(dialect, coltype)
+        to_decimal = sqltypes.processors.to_decimal_processor_factory(
+            decimal.Decimal, self._effective_decimal_return_scale
+        )
+
+        def process(value):
+            if value is None or isinstance(value, decimal.Decimal):
+                return value
+            if isinstance(value, int):
+                return decimal.Decimal(value)
+            return to_decimal(value)
+
+        return process
+
+
 class FlightSQLDialect(default.DefaultDialect):
     """
     Establishes baseline behavior of a FlightSQL Dialect. All other
@@ -132,6 +161,8 @@ class FlightSQLDialect(default.DefaultDialect):
     # Arrow already returns exact int/Decimal values; SQLAlchemy's non-native
     # Numeric processor would round them through float.
     supports_native_decimal = True
+    # Float subclasses Numeric; map it to itself so it keeps float results.
+    colspecs = {sqltypes.Numeric: FlightSQLNumeric, sqltypes.Float: sqltypes.Float}
     # JSON binds use SQLAlchemy's default json.dumps/json.loads; reflected
     # nested columns use ArrowNestedJSON, which passes Arrow values through.
     _json_serializer = None

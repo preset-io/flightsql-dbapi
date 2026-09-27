@@ -129,7 +129,9 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   treated as a disconnect; authentication and cancellation errors are not.
 - **Exact numeric results.** The dialects declare native decimal support, so
   `DECIMAL` and `uint64` (`NUMERIC(20, 0)`) values keep Arrow's exact
-  `Decimal`/`int` instead of being rounded through `float`. Struct, map and
+  `Decimal`/`int` instead of being rounded through `float`. A `Numeric`
+  declared over a floating-point column still returns `Decimal`, and `Float`
+  still returns `float`. Struct, map and
   nested-list columns reflect as `JSON` and pass Arrow's dicts and lists
   through unchanged. Non-finite float literals (`nan`, `inf`) do not compile;
   bind them as parameters.
