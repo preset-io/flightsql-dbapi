@@ -191,7 +191,9 @@ def test_transport_errors_are_dbapi_errors(error, expected):
 
 def test_unavailable_is_a_disconnect():
     dialect = DataFusionDialect()
-    assert dialect.is_disconnect(flightsql.OperationalError("Flight returned unavailable error"), None, None)
+    with pytest.raises(flightsql.OperationalError) as raised:
+        Cursor(_FailingClient(flight.FlightUnavailableError("Flight returned unavailable error"))).execute("SELECT 1")
+    assert dialect.is_disconnect(raised.value, None, None)
     assert not dialect.is_disconnect(flightsql.ProgrammingError("bad SQL"), None, None)
 
 
@@ -263,3 +265,109 @@ def test_only_the_prepared_statement_feature_switches_to_numbered_placeholders()
         dialect=prepared
     )
     assert "$1" in str(compiled) and "$2" in str(compiled)
+
+
+class CompliantCatalogClient(CatalogScopedClient):
+    """Spec-compliant: an unset catalog answers across every catalog."""
+
+    TABLES = {"datafusion": ("public", "t1"), "sales": ("public", "orders")}
+
+    def do_get(self, ticket):
+        kind, catalog = ticket
+        rows = [value for name, value in self.TABLES.items() if catalog in (None, name)]
+        if kind == "catalogs":
+            return SimpleNamespace(read_all=lambda: pa.table({"catalog_name": list(self.TABLES)}))
+        if kind == "schemas":
+            return SimpleNamespace(
+                read_all=lambda: pa.table({"db_schema_name": pa.array([s for s, _ in rows], pa.string())})
+            )
+        schema = self.calls[-1][1].get("db_schema_filter_pattern")
+        rows = [(s, t) for s, t in rows if schema in (None, s)]
+        table = pa.table(
+            {
+                "db_schema_name": pa.array([s for s, _ in rows], pa.string()),
+                "table_name": pa.array([t for _, t in rows], pa.string()),
+                "table_type": pa.array(["BASE TABLE"] * len(rows), pa.string()),
+            }
+        )
+        return SimpleNamespace(read_all=lambda: table)
+
+
+def test_legitimately_empty_answers_do_not_scope_a_compliant_server():
+    client = CompliantCatalogClient()
+    connection = Connection(client)
+    assert connection.flightsql_get_table_names("staging") == []
+    assert connection.flightsql_get_table_names(None) == ["t1", "orders"]
+    assert not any(name == "get_catalogs" for name, _ in client.calls)
+    assert all("catalog" not in kwargs for _, kwargs in client.calls)
+
+
+def test_parameter_record_with_union_parameter_schema_uses_union_binding():
+    # The Arrow C++ SQLite example server declares every parameter this way.
+    du = pa.dense_union(
+        [
+            pa.field("string_value", pa.string()),
+            pa.field("bigint_value", pa.int64()),
+            pa.field("double_value", pa.float64()),
+            pa.field("bytes_value", pa.binary()),
+        ]
+    )
+    record = build_parameter_record((1, "one"), pa.schema([("parameter_1", du), ("parameter_2", du)]))
+    assert record.schema.names == ["param_0", "param_1"]
+    assert all(pa.types.is_union(t) for t in record.schema.types)
+    assert record.to_pylist() == [{"param_0": 1, "param_1": "one"}]
+
+
+def test_uint64_and_decimal_results_are_not_rounded_through_float():
+    dialect = DataFusionDialect()
+    uint64 = flightsql.dbapi.resolve_sql_type(pa.uint64())
+    processor = uint64.result_processor(dialect, None)
+    value = 18446744073709551615
+    assert (processor(value) if processor else value) == value
+    decimal = flightsql.dbapi.resolve_sql_type(pa.decimal128(38, 10))
+    processor = decimal.result_processor(dialect, None)
+    exact = Decimal("1234567890123456789012345678.0123456789")
+    assert (processor(exact) if processor else exact) == exact
+
+
+def test_nested_values_pass_through_the_json_type():
+    dialect = DataFusionDialect()
+    nested = flightsql.dbapi.resolve_sql_type(pa.struct([("a", pa.int64())]))
+    processor = nested.result_processor(dialect, None)
+    assert processor({"a": 1}) == {"a": 1}
+    assert processor(None) is None
+
+
+def test_any_wrapping_another_message_is_not_a_prepared_handle():
+    url = b"type.googleapis.com/arrow.flight.protocol.sql.DoPutUpdateResult"
+    wrapped = b"\x0a" + bytes([len(url)]) + url + b"\x12\x02\x08\x01"
+    assert flight_client._updated_prepared_handle(wrapped) is None
+
+
+@pytest.mark.parametrize(
+    "cause, disconnect",
+    [
+        (flight.FlightUnavailableError("failed to connect to all addresses"), True),
+        (flight.FlightUnauthorizedError("user may not open a connection"), False),
+        (flight.FlightCancelledError("connection pool exhausted"), False),
+        (flight.FlightTimedOutError("deadline exceeded"), False),
+    ],
+)
+def test_only_an_unavailable_server_is_a_disconnect(cause, disconnect):
+    error = flightsql.OperationalError(str(cause))
+    error.__cause__ = cause
+    assert DataFusionDialect().is_disconnect(error, None, None) is disconnect
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_float_literals_fail_to_compile(value):
+    with pytest.raises(sqlalchemy.exc.CompileError, match="non-finite"):
+        _literal(value, sqltypes.NullType())
+
+
+@pytest.mark.skipif(not SQLALCHEMY_2, reason="numeric_dollar requires SQLAlchemy 2")
+def test_explicit_paramstyle_is_honored_with_prepared_statements():
+    dialect = sqlalchemy.create_engine(
+        "datafusion://localhost:1?insecure=true&feature-sqlalchemy-prepared-statements=on", paramstyle="qmark"
+    ).dialect
+    assert dialect.paramstyle == "qmark"

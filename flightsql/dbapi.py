@@ -249,8 +249,9 @@ class Connection:
     @translate_errors
     def flightsql_get_schema_names(self) -> List[str]:
         """Get the names of all schemas."""
-        names = self._schema_names(self._metadata_catalog())
-        if not names and self._catalog_fallback():
+        catalog = self._metadata_catalog()
+        names = self._schema_names(catalog)
+        if not names and self._catalog_fallback(unscoped_schemas_empty=catalog is None):
             names = self._schema_names(self._metadata_catalog())
         # A server answering for every catalog can repeat a schema name.
         return list(dict.fromkeys(names))
@@ -269,21 +270,35 @@ class Connection:
             return self.catalog
         return self._resolved_catalog[0] if self._resolved_catalog else None
 
-    def _catalog_fallback(self) -> bool:
+    def _catalog_fallback(self, unscoped_schemas_empty: bool = False) -> bool:
         """Resolve a catalog after an unscoped metadata RPC came back empty.
 
         Flight SQL defines an unset catalog as "no filtering", and compliant
-        servers answer GetDbSchemas/GetTables across every catalog, so they
-        never reach this path. Some servers (the DataFusion Flight SQL service
-        among them) only enumerate the catalog named in the request and return
-        zero rows otherwise, which would hide every schema and table. Resolve
-        one catalog from GetCatalogs -- DataFusion's default ``datafusion`` if
-        present, else the only catalog -- once per connection, and return
-        whether the caller should retry scoped to it. A server without
+        servers answer GetDbSchemas/GetTables across every catalog. Some
+        servers (the DataFusion Flight SQL service among them) only enumerate
+        the catalog named in the request and return zero rows otherwise, which
+        would hide every schema and table.
+
+        An empty answer to a filtered request (e.g. a schema with no tables)
+        is not evidence of that, so the decision rests on the unfiltered,
+        unscoped GetDbSchemas: only when it is empty is one catalog resolved
+        from GetCatalogs -- DataFusion's default ``datafusion`` if present,
+        else the only catalog. The outcome is a property of the server and is
+        decided once per connection; the return value says whether the caller
+        should retry scoped to the resolved catalog. A server without
         GetCatalogs keeps the unscoped (empty) answer.
         """
         if self.catalog is not None or self._resolved_catalog is not None:
             return False
+        if not unscoped_schemas_empty:
+            try:
+                answers_unscoped = bool(self._schema_names(None))
+            except pa.ArrowNotImplementedError:
+                answers_unscoped = False  # no GetDbSchemas: cannot tell, try GetCatalogs
+            if answers_unscoped:
+                # The server answers unscoped requests; the empty answer stands.
+                self._resolved_catalog = (None,)
+                return False
         resolved: Optional[str] = None
         try:
             info = self.client.get_catalogs()
@@ -818,9 +833,16 @@ def build_parameter_record(values: ExecuteParams, parameter_schema: Optional[pa.
     the binding batch uses exactly that schema (field names and types), which
     is what Flight SQL servers such as DataFusion's validate against. Servers
     that return no parameter schema receive the legacy one-dense-union-per-
-    parameter batch.
+    parameter batch, and so do servers that declare union-typed parameters
+    (such as the Arrow SQLite example server's ``dense_union<string, int64,
+    double, binary>``), which pyarrow cannot build from Python scalars.
     """
-    if parameter_schema is None or len(parameter_schema) != len(values) or len(values) == 0:
+    if (
+        parameter_schema is None
+        or len(parameter_schema) != len(values)
+        or len(values) == 0
+        or any(pa.types.is_union(field.type) for field in parameter_schema)
+    ):
         return ParameterRecordBuilder(values).build_record()
     arrays = []
     for value, field in zip(values, parameter_schema):

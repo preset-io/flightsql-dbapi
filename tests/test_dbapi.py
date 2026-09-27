@@ -428,6 +428,9 @@ def test_get_columns_returns_empty_result_for_unknown_table():
             return table
 
     class Client:
+        def get_db_schemas(self, **kwargs):
+            raise pa.ArrowNotImplementedError("GetDbSchemas unimplemented")
+
         def get_catalogs(self):
             raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
 
@@ -472,6 +475,9 @@ def test_get_table_metadata_uses_one_included_schema_request_and_marks_partial_r
     class Client:
         def __init__(self):
             self.calls = []
+
+        def get_db_schemas(self, **kwargs):
+            raise pa.ArrowNotImplementedError("GetDbSchemas unimplemented")
 
         def get_catalogs(self):
             raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
@@ -520,6 +526,9 @@ def test_table_metadata_filters_and_keys_same_table_name_by_requested_schema():
             return table
 
     class Client:
+        def get_db_schemas(self, **kwargs):
+            raise pa.ArrowNotImplementedError("GetDbSchemas unimplemented")
+
         def get_catalogs(self):
             raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
 
@@ -554,6 +563,9 @@ def test_table_metadata_rejects_missing_table_name_column_explicitly(table):
             return table
 
     class Client:
+        def get_db_schemas(self, **kwargs):
+            raise pa.ArrowNotImplementedError("GetDbSchemas unimplemented")
+
         def get_catalogs(self):
             raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
 
@@ -586,6 +598,9 @@ def test_table_metadata_rejects_missing_table_name_column_explicitly(table):
 )
 def test_table_metadata_rejects_malformed_response_shapes_explicitly(info, reader, message):
     class Client:
+        def get_db_schemas(self, **kwargs):
+            raise pa.ArrowNotImplementedError("GetDbSchemas unimplemented")
+
         def get_catalogs(self):
             raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
 
@@ -616,6 +631,9 @@ def test_get_table_metadata_distinguishes_names_only_response_from_empty_catalog
             self.names_table = names_table if names_table is not None else included_schema_table
             self.requested_include_schema = True
 
+        def get_db_schemas(self, **kwargs):
+            raise pa.ArrowNotImplementedError("GetDbSchemas unimplemented")
+
         def get_catalogs(self):
             raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
 
@@ -639,6 +657,9 @@ def test_get_table_metadata_distinguishes_names_only_response_from_empty_catalog
 
 def test_get_table_metadata_does_not_mask_transport_errors():
     class Client:
+        def get_db_schemas(self, **kwargs):
+            raise pa.ArrowNotImplementedError("GetDbSchemas unimplemented")
+
         def get_catalogs(self):
             raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
 
@@ -658,6 +679,9 @@ def test_empty_included_schema_response_does_not_mask_names_rpc_errors():
             return pa.table({"table_name": pa.array([], type=pa.string())})
 
     class Client:
+        def get_db_schemas(self, **kwargs):
+            raise pa.ArrowNotImplementedError("GetDbSchemas unimplemented")
+
         def get_catalogs(self):
             raise pa.ArrowNotImplementedError("GetCatalogs unimplemented")
 

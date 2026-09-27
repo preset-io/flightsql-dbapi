@@ -419,6 +419,9 @@ def _updated_prepared_handle(payload: bytes) -> Optional[bytes]:
     fields = _protobuf_fields(payload)
     if fields and fields.get(1) == _DO_PUT_PREPARED_RESULT_URL.encode() and 2 in fields:
         fields = _protobuf_fields(fields[2])
+    elif fields and (fields.get(1) or b"").startswith(b"type.googleapis.com/"):
+        # An Any wrapping some other message (e.g. DoPutUpdateResult).
+        return None
     if not fields:
         return None
     return fields.get(1) or None

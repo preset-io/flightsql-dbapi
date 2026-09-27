@@ -1,10 +1,12 @@
 import datetime
 import inspect
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, MutableMapping, Sequence, Tuple
 
 import sqlalchemy
+from pyarrow import flight
 from sqlalchemy import exc, pool
 from sqlalchemy.dialects import registry
 from sqlalchemy.engine import URL, default, reflection
@@ -119,6 +121,10 @@ def client_from_url(url: URL) -> FlightSQLClient:
     )
 
 
+def _passthrough(value: Any) -> Any:
+    return value
+
+
 class FlightSQLDialect(default.DefaultDialect):
     """
     Establishes baseline behavior of a FlightSQL Dialect. All other
@@ -127,6 +133,12 @@ class FlightSQLDialect(default.DefaultDialect):
 
     driver = "flightsql"
     sql_info: Dict[int, Any] = {}
+    # Arrow already returns exact int/Decimal values; SQLAlchemy's non-native
+    # Numeric processor would round them through float.
+    supports_native_decimal = True
+    # Arrow returns struct/map/nested-list values as Python dicts and lists.
+    _json_serializer = None
+    _json_deserializer = staticmethod(_passthrough)
     # Used when the server does not report SQL_IDENTIFIER_QUOTE_CHAR.
     default_identifier_quote = '"'
 
@@ -200,10 +212,9 @@ class FlightSQLDialect(default.DefaultDialect):
         return [client], ({"catalog": url.database} if url.database else {})
 
     def is_disconnect(self, e, connection, cursor):
-        if isinstance(e, OperationalError):
-            text = str(e).lower()
-            return "unavailable" in text or "connection" in text or "socket closed" in text
-        return False
+        # Only an unavailable server is a lost connection; authentication and
+        # cancellation errors are OperationalError too but leave it usable.
+        return isinstance(e, OperationalError) and isinstance(e.__cause__, flight.FlightUnavailableError)
 
     @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kwargs):
@@ -454,6 +465,8 @@ class LiteralBindCompiler(compiler.SQLCompiler):
             if value.tzinfo is not None:
                 raise exc.CompileError("time zone aware time literals are not supported")
             return f"TIME '{value.isoformat()}'"
+        if isinstance(value, float) and not math.isfinite(value):
+            raise exc.CompileError(f"non-finite float literal {value!r} is not supported; bind it as a parameter")
         if isinstance(value, (bytes, bytearray, memoryview)) and type_._type_affinity is sqltypes._Binary:
             return f"X'{bytes(value).hex()}'"
         return super().render_literal_value(value, type_)
@@ -474,6 +487,11 @@ class DataFusionDialect(FlightSQLDialect):
 
     paramstyle = "qmark"
 
+    def __init__(self, *args, **kwargs):
+        # create_engine(..., paramstyle=...) is honored as given.
+        self._explicit_paramstyle = kwargs.get("paramstyle") is not None
+        super().__init__(*args, **kwargs)
+
     def create_connect_args(self, url: URL) -> Tuple[Sequence[Any], MutableMapping[str, Any]]:
         args, kwargs = super().create_connect_args(url)
         # DataFusion binds numbered placeholders ($1, $2, ...); every bare "?"
@@ -483,7 +501,11 @@ class DataFusionDialect(FlightSQLDialect):
         # path. The default literal-bind path keeps qmark: under numeric
         # paramstyles SQLAlchemy re-scans the post-compiled statement for
         # %(name)s, which would corrupt literal values containing that text.
-        if args[0].features.get(FEATURE_PREPARED_STATEMENTS) == "on" and _SQLALCHEMY_2:
+        if (
+            args[0].features.get(FEATURE_PREPARED_STATEMENTS) == "on"
+            and _SQLALCHEMY_2
+            and not self._explicit_paramstyle
+        ):
             self.paramstyle = "numeric_dollar"
             self.positional = True
         return args, kwargs

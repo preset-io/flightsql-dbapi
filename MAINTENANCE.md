@@ -91,10 +91,15 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   failing every connection.
 - **Metadata is catalog-scoped.** GetDbSchemas/GetTables with no catalog return
   zero rows instead of every catalog. A catalog named in the URL
-  (`datafusion://host:port/<catalog>`) scopes every metadata RPC. Without one,
-  an unscoped empty answer triggers one GetCatalogs lookup per connection
-  (`datafusion` if present, else the only catalog) and a scoped retry. Servers
-  that answer unscoped requests never pay for the extra RPC.
+  (`datafusion://host:port/<catalog>`) scopes every metadata RPC. **This is a
+  change for every server using these dialects:** the URL database used to be
+  ignored, and now filters reflection to that catalog with no fallback.
+  Without one, an empty unscoped answer is checked against the unfiltered,
+  unscoped GetDbSchemas. Only when that is empty too (the server cannot
+  answer unscoped) does the connection resolve one catalog via GetCatalogs
+  (`datafusion` if present, else the only catalog) and retry scoped. A
+  legitimately empty answer from a compliant server (such as a schema with no
+  tables) costs one extra GetDbSchemas and never scopes the connection.
 - **Views are reported with `table_type = VIEW`.** `get_table_names()` excludes
   them, `get_view_names()` lists them, and `has_table()` covers both.
 - **Strings arrive as Utf8View.** Arrow string, binary and list view types map
@@ -107,7 +112,11 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   it), and returns the bound handle from DoPut as a
   `DoPutPreparedStatementResult`. The client binds against the returned schema
   (nullable, so `NULL` binds work), executes the returned handle, and the
-  opt-in prepared-statement feature renders `$n` placeholders on SQLAlchemy 2.
+  opt-in prepared-statement feature renders `$n` placeholders on SQLAlchemy 2
+  (an explicit `create_engine(..., paramstyle=...)` is honored instead).
+  Servers that return no parameter schema, or declare union-typed parameters
+  (the Arrow SQLite example server's `dense_union<string, int64, double,
+  binary>`), keep the legacy one-dense-union-per-parameter binding.
   The default literal path keeps qmark: SQLAlchemy's numeric paramstyles
   rescan the post-compiled statement for `%(name)s`, which would corrupt
   literal values containing that text. The server cannot type a placeholder
@@ -116,7 +125,14 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   (`OperationalError` for unavailable/unauthenticated, `NotSupportedError` for
   unimplemented, `ProgrammingError`/`InternalError`/`DatabaseError` otherwise)
   with the original chained, so SQLAlchemy wraps them and pool pre-ping
-  recycles connections after a server restart.
+  recycles connections after a server restart. Only an unavailable server is
+  treated as a disconnect; authentication and cancellation errors are not.
+- **Exact numeric results.** The dialects declare native decimal support, so
+  `DECIMAL` and `uint64` (`NUMERIC(20, 0)`) values keep Arrow's exact
+  `Decimal`/`int` instead of being rounded through `float`. Struct, map and
+  nested-list columns reflect as `JSON` and pass Arrow's dicts and lists
+  through unchanged. Non-finite float literals (`nan`, `inf`) do not compile;
+  bind them as parameters.
 - **No placeholder credentials.** Without a token or user/password no
   `authorization` header is sent (previously `Bearer None`).
 
