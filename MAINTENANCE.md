@@ -94,6 +94,14 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   (`datafusion://host:port/<catalog>`) scopes every metadata RPC. **This is a
   change for every server using these dialects:** the URL database used to be
   ignored, and now filters reflection to that catalog with no fallback.
+  **Migration warning:** a nonexistent or inaccessible catalog can return an
+  empty reflection result without an error. For example, on InfluxDB,
+  `datafusion://h:p/db1?database=db1` can reflect `[]`: the path is a Flight SQL
+  catalog filter, while `database=db1` is server request metadata, not a catalog.
+  Use `datafusion://h:p?database=db1` unless `db1` is an advertised catalog.
+  We deliberately retain empty-result semantics rather than raising/warning:
+  an empty, permission-filtered, or nonexistent catalog cannot reliably be
+  distinguished from a successful zero-row metadata response.
   Without one, an empty unscoped answer is checked against the unfiltered,
   unscoped GetDbSchemas. Only when that is empty too (the server cannot
   answer unscoped) does the connection resolve one catalog via GetCatalogs
@@ -111,7 +119,9 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   numbered placeholders (`$1`, `$2`; every bare `?` is the same placeholder to
   it), and returns the bound handle from DoPut as a
   `DoPutPreparedStatementResult`. The client binds against the returned schema
-  (nullable, so `NULL` binds work), executes the returned handle, and the
+  (nullable, so `NULL` binds work). In `0.2.2.3`, values are inferred first and
+  safely cast: fractional floats/Decimals cannot silently truncate to integer
+  parameters and instead raise `DataError`. It executes the returned handle, and the
   opt-in prepared-statement feature renders `$n` placeholders on SQLAlchemy 2
   (an explicit `create_engine(..., paramstyle=...)` is honored instead).
   Servers that return no parameter schema, or declare union-typed parameters
@@ -127,11 +137,15 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   with the original chained, so SQLAlchemy wraps them and pool pre-ping
   recycles connections after a server restart. Only an unavailable server is
   treated as a disconnect; authentication and cancellation errors are not.
-- **Exact numeric results.** The dialects declare native decimal support, so
+- **Exact numeric results.** The dialects use a dedicated Numeric result processor, so
   `DECIMAL` and `uint64` (`NUMERIC(20, 0)`) values keep Arrow's exact
   `Decimal`/`int` instead of being rounded through `float`. A `Numeric`
   declared over a floating-point column still returns `Decimal`, and `Float`
-  still returns `float`. Struct, map and
+  still returns `float`. In `0.2.2.3`, SQLAlchemy Numeric/Float Decimal binds
+  again convert to float (the legacy behavior), independently of exact result
+  processing. Direct DB API typed decimal parameters retain Arrow decimal
+  precision; SQLAlchemy's float bind path does not promise exact decimal input.
+  Struct, map and
   nested-list columns reflect as `JSON` and pass Arrow's dicts and lists
   through unchanged. Non-finite float literals (`nan`, `inf`) do not compile;
   bind them as parameters.
@@ -180,9 +194,9 @@ artifact URL together with its SHA-256. A PEP 508 direct reference to
 supported where a source pin is required instead.
 
 1. Record the internal fork version in `pyproject.toml` and
-   `flightsql/__init__.py` (currently `0.2.2.2`). Published artifacts are
+   `flightsql/__init__.py` (currently `0.2.2.3`). Published artifacts are
    immutable and are never rebuilt in place, so any subsequent change ships as
-   a new fourth component (`0.2.2.3`, and so on). The pipeline refuses to
+   a new fourth component (`0.2.2.4`, and so on). The pipeline refuses to
    overwrite an existing key rather than relying on this being remembered.
 2. Run the installed-wheel matrix and the reference-server suite, and merge the
    reviewed, green version change.

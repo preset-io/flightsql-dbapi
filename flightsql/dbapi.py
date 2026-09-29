@@ -860,7 +860,12 @@ def build_parameter_record(values: ExecuteParams, parameter_schema: Optional[pa.
     arrays = []
     for value, field in zip(values, parameter_schema):
         try:
-            arrays.append(pa.array([value], type=field.type))
+            # Construct without a target type first: pa.array(..., type=...)
+            # silently truncates fractional float/Decimal values for integers.
+            # Arrow infers signed int64 for Python ints, even above its range.
+            # Preserve uint64 inputs without converting them through float.
+            source_type = pa.uint64() if isinstance(value, int) and value >= 2**63 else None
+            arrays.append(pa.array([value], type=source_type).cast(field.type, safe=True))
         except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, OverflowError) as error:
             raise DataError(
                 f"cannot bind {type(value).__name__} value to parameter {field.name!r} of type {field.type}"

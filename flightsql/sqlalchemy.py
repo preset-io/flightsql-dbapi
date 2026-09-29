@@ -158,9 +158,9 @@ class FlightSQLDialect(default.DefaultDialect):
 
     driver = "flightsql"
     sql_info: Dict[int, Any] = {}
-    # Arrow already returns exact int/Decimal values; SQLAlchemy's non-native
-    # Numeric processor would round them through float.
-    supports_native_decimal = True
+    # Keep SQLAlchemy's Decimal-to-float bind conversion for legacy union
+    # servers. FlightSQLNumeric preserves exact int/Decimal results separately.
+    supports_native_decimal = False
     # Float subclasses Numeric; map it to itself so it keeps float results.
     colspecs = {sqltypes.Numeric: FlightSQLNumeric, sqltypes.Float: sqltypes.Float}
     # JSON binds use SQLAlchemy's default json.dumps/json.loads; reflected

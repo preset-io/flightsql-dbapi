@@ -74,7 +74,7 @@ matches its bytes to the externally supplied digest; it does not trust optional
 installer `archive_info` and reports `commit_verified: false`. This verifies the
 referenced file, not a build linkage between that file and the installed tree.
 Do not publish this fork as `flightsql-dbapi` on a public package index. The
-internal fork version is `0.2.2.2`; see
+internal fork version is `0.2.2.3`; see
 [MAINTENANCE.md](MAINTENANCE.md) for the complete threat boundary and matrix.
 
 ## Usage
@@ -248,3 +248,11 @@ than silently weakening transport security. `insecure=true` and
 
 Any query parameters *not* specified in the above table will be sent to the
 upstream server as gRPC metadata.
+
+### Catalog URL migration (0.2.2.3)
+
+The URL path now filters reflection by Flight SQL catalog. A wrong or inaccessible
+catalog may return an empty list **without an error**, with no fallback. On
+InfluxDB, use `datafusion://host:port?database=db1` for database request metadata;
+only add `/db1` if `db1` is also an advertised Flight SQL catalog. See
+[compatibility notes](MAINTENANCE.md#datafusion-flight-sql-service-compatibility).

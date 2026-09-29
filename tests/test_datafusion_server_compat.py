@@ -388,3 +388,54 @@ def test_numeric_over_a_double_column_still_returns_decimal():
     assert _result(sqltypes.Numeric(asdecimal=False), Decimal("1.5")) == 1.5
     assert isinstance(_result(sqltypes.Float(), 1.5), float)
     assert _result(sqltypes.Numeric(10, 2), None) is None
+
+
+@pytest.mark.parametrize("value", [1.5, Decimal("1.9")])
+def test_typed_integer_parameter_rejects_fractional_values(value):
+    with pytest.raises(flightsql.DataError, match="cannot bind.*int64") as raised:
+        build_parameter_record((value,), pa.schema([("$1", pa.int64())]))
+    assert isinstance(raised.value.__cause__, pa.ArrowInvalid)
+
+
+@pytest.mark.parametrize("value", [1, 1.0, Decimal("1.0"), None])
+def test_typed_integer_parameter_accepts_lossless_values(value):
+    record = build_parameter_record((value,), pa.schema([("$1", pa.int64())]))
+    assert record.to_pylist() == [{"$1": None if value is None else 1}]
+
+
+@pytest.mark.parametrize("type_", [sqltypes.Numeric(10, 2), sqltypes.Float()])
+@pytest.mark.parametrize("schema_kind", ["absent", "union", "double"])
+def test_decimal_sqlalchemy_bind_reaches_prepared_parameter_record(type_, schema_kind):
+    engine = sqlalchemy.create_engine(
+        "datafusion://localhost:1?insecure=true&feature-sqlalchemy-prepared-statements=on",
+        paramstyle="qmark",
+    )
+    compiled = select(bindparam("value", type_=type_)).compile(dialect=engine.dialect)
+    value = Decimal("2.0")
+    processor = compiled._bind_processors.get("value")
+    bound = processor(value) if processor else value
+    if schema_kind == "absent":
+        schema = None
+    elif schema_kind == "union":
+        schema = pa.schema([("$1", pa.dense_union([pa.field("double", pa.float64())]))])
+    else:
+        schema = pa.schema([("$1", pa.float64())])
+    record = build_parameter_record((bound,), schema)
+    assert list(record.to_pylist()[0].values()) == [2.0]
+    assert isinstance(bound, float)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "value, target",
+    [(18446744073709551615, pa.uint64()), (Decimal("12345678901234567890.0123456789"), pa.decimal128(38, 10))],
+)
+def test_typed_parameter_preserves_exact_numeric_values(value, target):
+    record = build_parameter_record((value,), pa.schema([("$1", target)]))
+    assert record.to_pylist() == [{"$1": value}]
+
+
+@pytest.mark.parametrize("value", [2**63, -(2**63) - 1])
+def test_typed_integer_parameter_rejects_overflow(value):
+    with pytest.raises(flightsql.DataError, match="cannot bind.*int64"):
+        build_parameter_record((value,), pa.schema([("$1", pa.int64())]))

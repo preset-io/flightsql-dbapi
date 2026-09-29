@@ -1,10 +1,13 @@
 import warnings
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from sqlalchemy import (
     Column,
+    Float,
     Integer,
+    Numeric,
     String,
     bindparam,
     create_engine,
@@ -318,3 +321,20 @@ def test_integration_dialect_basic_orm_with_prepared_statements():
     assert [r.value for r in results] == [1, 0, -1]
     session.close()
     engine.dispose()
+
+
+@pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)
+@pytest.mark.parametrize("type_", [Numeric(10, 2), Float()])
+def test_integration_prepared_decimal_bind(type_):
+    host, port = integration.host_port()
+    engine = create_engine(
+        f"datafusion://{host}:{port}?insecure=true&feature-sqlalchemy-prepared-statements=on",
+        paramstyle="qmark",
+    )
+    table = Table("intTable", MetaData(), Column("id", Integer), Column("value", type_))
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(select(table.c.id).where(table.c.value > Decimal("0.5"))).all()
+        assert rows == [(1,)]
+    finally:
+        engine.dispose()
