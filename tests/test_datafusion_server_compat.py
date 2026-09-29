@@ -15,7 +15,7 @@ import pytest
 import sqlalchemy
 from pyarrow import flight
 from sqlalchemy import bindparam, select
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.sql import sqltypes
 
 import flightsql
@@ -407,7 +407,12 @@ def test_typed_integer_parameter_accepts_lossless_values(value):
 @pytest.mark.parametrize("schema_kind", ["absent", "union", "double"])
 def test_decimal_sqlalchemy_bind_reaches_prepared_parameter_record(type_, schema_kind):
     engine = sqlalchemy.create_engine(
-        "datafusion://localhost:1?insecure=true&feature-sqlalchemy-prepared-statements=on",
+        URL.create(
+            "datafusion",
+            host="localhost",
+            port=1,
+            query={"insecure": "true", "feature-sqlalchemy-prepared-statements": "on"},
+        ),
         paramstyle="qmark",
     )
     compiled = select(bindparam("value", type_=type_)).compile(dialect=engine.dialect)

@@ -328,7 +328,12 @@ def test_integration_dialect_basic_orm_with_prepared_statements():
 def test_integration_prepared_decimal_bind(type_):
     host, port = integration.host_port()
     engine = create_engine(
-        f"datafusion://{host}:{port}?insecure=true&feature-sqlalchemy-prepared-statements=on",
+        URL.create(
+            "datafusion",
+            host=host,
+            port=port,
+            query={"insecure": "true", "feature-sqlalchemy-prepared-statements": "on"},
+        ),
         paramstyle="qmark",
     )
     table = Table("intTable", MetaData(), Column("id", Integer), Column("value", type_))
