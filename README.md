@@ -255,13 +255,19 @@ The URL path filters **reflection only**, not SQL execution. It must match the
 server's default catalog: the DataFusion dialect reads
 `datafusion.catalog.default_catalog` from `information_schema.df_settings` at
 connection initialization and rejects mismatches or an unverifiable default.
+**Server prerequisite:** enable `datafusion.catalog.information_schema=true`
+in the DataFusion session configuration before starting the Flight SQL service.
+DataFusion disables information-schema tables by default: a plain
+`SessionContext::new()` does not expose `information_schema.df_settings`, so
+even `/datafusion` fails to connect with "cannot verify the URL catalog".
+If the server cannot expose that setting, omit the URL path.
 Otherwise, a table reflected from `/cat2` could silently read a same-named table
 in the default catalog. Configure the server/session default before using another
 catalog; the dialect does not switch it. On InfluxDB use
 `datafusion://host:port?database=db1` for database request metadata, without `/db1`.
 Direct DB API `catalog=` only filters metadata and does not perform this check.
 
-With prepared statements and positional placeholders, raw `text()` or
+In both literal and prepared mode with positional placeholders, raw `text()` or
 `literal_column()` fragments containing `%(name)s` are rejected with `CompileError`:
 SQLAlchemy would otherwise rewrite that text or raise `KeyError`. Pass these
 strings as bound values instead. See the

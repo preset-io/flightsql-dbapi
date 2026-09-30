@@ -100,6 +100,11 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   reads `datafusion.catalog.default_catalog` from `information_schema.df_settings`
   at initialization when a path is supplied,
   rejecting mismatches before any reflected table can query the wrong catalog.
+  **Server prerequisite:** enable `datafusion.catalog.information_schema=true`
+  in the session configuration before starting the Flight SQL service.
+  DataFusion leaves this off by default; a plain `SessionContext::new()` does
+  not expose `information_schema.df_settings`. Every URL path, including
+  `/datafusion`, then fails with "cannot verify the URL catalog".
   If the server cannot report its default, initialization fails closed: omit
   the path rather than using an unverified reflection filter. To use another
   catalog, configure that default on the server/session first; this dialect
@@ -111,12 +116,16 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   Without one, an empty unscoped answer is checked against the unfiltered,
   unscoped GetDbSchemas. Only when that is empty too (the server cannot
   answer unscoped) does the connection resolve one catalog via GetCatalogs
-  (`datafusion` if present, else the only catalog) and retry scoped. A
+  (the only catalog, or `datafusion.catalog.default_catalog` read from
+  `information_schema.df_settings` when multiple catalogs exist) and retry
+  scoped. Multiple catalogs without a verifiable default remain unscoped;
+  a catalog named `datafusion` is never assumed to be the execution default. A
   legitimately empty answer from a compliant server (such as a schema with no
   tables) costs one extra GetDbSchemas and never scopes the connection.
   Flight/INVALID_ARGUMENT failures in the advisory fallback probes (including
   their streams) preserve the successful empty response and leave the connection
-  unscoped. Failures of the original metadata request still propagate.
+  unscoped without caching the failure, so the next call retries discovery.
+  Failures of the original metadata request still propagate.
 - **Views are reported with `table_type = VIEW`.** `get_table_names()` excludes
   them, `get_view_names()` lists them, and `has_table()` covers both.
 - **Strings arrive as Utf8View.** Arrow string, binary and list view types map
@@ -143,12 +152,12 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   binary>`), keep the legacy one-dense-union-per-parameter binding.
   The default literal path keeps qmark: SQLAlchemy's numeric paramstyles
   rescan the post-compiled statement for `%(name)s`, which would corrupt
-  literal values containing that text. **Prepared-path limitation:** this
+  literal values containing that text. **Raw-fragment limitation:** this
   upstream numeric rewrite also scans raw `text()` and `literal_column()` SQL.
   In `0.2.2.4` those fragments containing `%(name)s` raise a clear `CompileError`
   rather than a `KeyError` or silently changing a literal into `$n`. Pass such
   strings as bound values, not raw SQL. SQLAlchemy 2 also rewrites raw tokens
-  for qmark, so the guard covers all positional prepared paramstyles; choosing
+  for qmark, so the guard covers literal and prepared positional paramstyles; choosing
   qmark is not an escape hatch for raw fragments.
   The server cannot type a placeholder
   that has no column context (`SELECT $1`); that is a server-side limit.
