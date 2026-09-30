@@ -419,7 +419,27 @@ class FlightSQLDialect(default.DefaultDialect):
         return []
 
 
-class LiteralBindCompiler(compiler.SQLCompiler):
+class RawSQLFragmentCompiler(compiler.SQLCompiler):
+    """Reject raw pyformat tokens before SQLAlchemy's positional rewrite sees them."""
+
+    def _check_raw_fragment(self, text):
+        if self.dialect.positional and re.search(r"%\([^)]+\)s", text):
+            raise exc.CompileError(
+                "raw SQL containing %(name)s is unsafe with positional parameters; "
+                "pass the string as a bind parameter instead"
+            )
+
+    def visit_textclause(self, textclause, **kwargs):
+        self._check_raw_fragment(textclause.text)
+        return super().visit_textclause(textclause, **kwargs)
+
+    def visit_column(self, column, *args, **kwargs):
+        if column.is_literal:
+            self._check_raw_fragment(column.name)
+        return super().visit_column(column, *args, **kwargs)
+
+
+class LiteralBindCompiler(RawSQLFragmentCompiler):
     # Render bind parameters into the SQL immediately before execution. IOx
     # does not support prepared statements, but SQLAlchemy's post-compile
     # literal tokens keep cached statements independent of prior values.
@@ -501,24 +521,8 @@ class LiteralBindCompiler(compiler.SQLCompiler):
         return super().render_literal_value(value, type_)
 
 
-class PreparedStatementCompiler(compiler.SQLCompiler):
-    """Reject raw pyformat tokens before SQLAlchemy's positional rewrite sees them."""
-
-    def _check_raw_prepared_fragment(self, text):
-        if self.dialect.positional and re.search(r"%\([^)]+\)s", text):
-            raise exc.CompileError(
-                "raw SQL containing %(name)s is unsafe with positional prepared parameters; "
-                "pass the string as a bind parameter instead"
-            )
-
-    def visit_textclause(self, textclause, **kwargs):
-        self._check_raw_prepared_fragment(textclause.text)
-        return super().visit_textclause(textclause, **kwargs)
-
-    def visit_column(self, column, *args, **kwargs):
-        if column.is_literal:
-            self._check_raw_prepared_fragment(column.name)
-        return super().visit_column(column, *args, **kwargs)
+class PreparedStatementCompiler(RawSQLFragmentCompiler):
+    """Compile positional prepared parameters with raw-fragment safety checks."""
 
 
 class DataFusionDialect(FlightSQLDialect):

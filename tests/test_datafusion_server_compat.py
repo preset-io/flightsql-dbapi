@@ -680,3 +680,26 @@ def test_failed_default_catalog_discovery_stays_unscoped_and_retries(rpc, error_
     assert conn._resolved_catalog is None
     client.fail = False
     assert conn.flightsql_get_table_names("public") == ["orders", "east_orders"]
+
+
+@pytest.mark.parametrize("fragment", ["text", "literal_column"])
+@pytest.mark.parametrize("literal_binds", [False, True])
+@pytest.mark.parametrize("paramstyle", ["qmark", "numeric"])
+def test_literal_raw_pyformat_fragments_fail_before_positional_rewrite(fragment, literal_binds, paramstyle):
+    dialect = DataFusionDialect(paramstyle=paramstyle)
+    dialect.statement_compiler = LiteralBindCompiler
+    expression = (sqlalchemy.text if fragment == "text" else sqlalchemy.literal_column)("SELECT '%(x)s'")
+    with pytest.raises(sqlalchemy.exc.CompileError, match="raw.*bind parameter"):
+        expression.compile(dialect=dialect, compile_kwargs={"literal_binds": literal_binds})
+
+
+@pytest.mark.parametrize("literal_binds", [False, True])
+def test_literal_pyformat_string_is_safe_as_a_bound_value(literal_binds):
+    dialect = DataFusionDialect()
+    dialect.statement_compiler = LiteralBindCompiler
+    compiled = select(bindparam("x", "%(x)s")).compile(dialect=dialect, compile_kwargs={"literal_binds": literal_binds})
+    if literal_binds:
+        assert "'%(x)s'" in str(compiled)
+    else:
+        expanded = compiled._process_parameters_for_postcompile(compiled.construct_params())
+        assert "'%(x)s'" in expanded.statement
