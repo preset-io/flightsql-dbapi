@@ -59,8 +59,12 @@ repeated-bind cache regression. The fork additionally bypasses a 1.4.6 compiler
 assertion for empty tuple-valued expanding binds and covers empty/nonempty cache
 reuse. The dialect does not claim compatibility with 1.4.0–1.4.5.
 
-The non-prepared compiler requires a concrete SQLAlchemy type for every
-non-NULL literal value; untyped non-NULL binds are rejected. A `None` value is
+The non-prepared compiler renders every bind as a literal. An untyped bind
+(for example `text(":v")`) is typed from its Python value with SQLAlchemy's own
+literal resolver (str, int, float, Decimal, bool, date/datetime/time, bytes);
+a value that resolver cannot map stays untyped and is rejected. Temporal and
+binary values render as typed SQL literals (`TIMESTAMP '...'`, `DATE '...'`,
+`TIME '...'`, `X'...'`) rather than quoted strings. A `None` value is
 handled separately by the compiler and emitted as SQL `NULL` for String,
 Integer, and NullType binds on both declared SQLAlchemy floors. A type that opts
 into `should_evaluate_none` retains its own literal processor. SQLAlchemy
@@ -70,10 +74,117 @@ rather than a true bulk parameter batch.
 
 The bundled SQLite Flight SQL reference server proves the DB API transport,
 reflection contracts, literal/prepared compiler paths, and installed-wheel
-entry point. It does **not** certify production InfluxDB/IOx or DataFusion
-semantics, real TLS certificate validation, or live Basic/Bearer authentication.
-Changes in those areas require bounded unit coverage here and a staging smoke
-test by the consuming service before its pin moves.
+entry point. It does **not** certify production InfluxDB/IOx semantics or live
+Basic authentication. Changes in those areas require bounded unit coverage here
+and a staging smoke test by the consuming service before its pin moves.
+
+### DataFusion Flight SQL service compatibility
+
+`0.2.2.2` was qualified live against a local server built on
+[`datafusion-flight-sql-server`](https://github.com/datafusion-contrib/datafusion-flight-sql-server)
+0.4.19 (DataFusion 55.1), including verified TLS with a private CA and bearer
+authentication. That service differs from the reference server in ways the
+client now handles, each covered by `tests/test_datafusion_server_compat.py`:
+
+- **GetSqlInfo is unimplemented.** Dialect initialization falls back to the
+  `"` identifier quote and the default read/write capability flags instead of
+  failing every connection.
+- **Metadata is catalog-scoped.** GetDbSchemas/GetTables with no catalog return
+  zero rows instead of every catalog. A catalog named in the URL
+  (`datafusion://host:port/<catalog>`) scopes every metadata RPC. **This is a
+  change for every server using these dialects:** the URL database used to be
+  ignored, and now filters reflection to that catalog with no fallback.
+  **Execution safety (0.2.2.4):** the URL path is only a reflection filter;
+  it does not change the server's SQL execution catalog or qualify SQL table
+  names. It must equal the server's default catalog. The DataFusion dialect
+  reads `datafusion.catalog.default_catalog` from `information_schema.df_settings`
+  at initialization when a path is supplied,
+  rejecting mismatches before any reflected table can query the wrong catalog.
+  **Server prerequisite:** enable `datafusion.catalog.information_schema=true`
+  in the session configuration before starting the Flight SQL service.
+  DataFusion leaves this off by default; a plain `SessionContext::new()` does
+  not expose `information_schema.df_settings`. Every URL path, including
+  `/datafusion`, then fails with "cannot verify the URL catalog".
+  If the server cannot report its default, initialization fails closed: omit
+  the path rather than using an unverified reflection filter. To use another
+  catalog, configure that default on the server/session first; this dialect
+  does not switch it for you. Raw SQL can use fully qualified table names.
+  On InfluxDB use `datafusion://h:p?database=db1`: `database=db1` is request
+  metadata, not a Flight SQL catalog. Direct DB API `catalog=` and custom
+  FlightSQL dialects still only filter metadata and can return empty reflection
+  without an error; their callers must keep execution and reflection aligned.
+  Without one, an empty unscoped answer is checked against the unfiltered,
+  unscoped GetDbSchemas. Only when that is empty too (the server cannot
+  answer unscoped) does the connection resolve one catalog via GetCatalogs
+  (the only catalog, or `datafusion.catalog.default_catalog` read from
+  `information_schema.df_settings` when multiple catalogs exist) and retry
+  scoped. Multiple catalogs without a verifiable default remain unscoped;
+  a catalog named `datafusion` is never assumed to be the execution default. A
+  legitimately empty answer from a compliant server (such as a schema with no
+  tables) costs one extra GetDbSchemas and never scopes the connection.
+  Flight/INVALID_ARGUMENT failures in the advisory fallback probes (including
+  their streams) preserve the successful empty response and leave the connection
+  unscoped without caching the failure, so the next call retries discovery.
+  Failures of the original metadata request still propagate.
+- **Views are reported with `table_type = VIEW`.** `get_table_names()` excludes
+  them, `get_view_names()` lists them, and `has_table()` covers both.
+- **Strings arrive as Utf8View.** Arrow string, binary and list view types map
+  to SQL types instead of an untyped blob. Reflected and described types are
+  type instances carrying decimal precision/scale, timestamp time zone
+  awareness and list element types; unsigned 64-bit integers reflect as
+  `NUMERIC(20, 0)`. Cursor descriptions are PEP 249 seven-item tuples.
+- **Prepared statements.** The server returns a typed `parameter_schema`, binds
+  numbered placeholders (`$1`, `$2`; every bare `?` is the same placeholder to
+  it), and returns the bound handle from DoPut as a
+  `DoPutPreparedStatementResult`. The client binds against the returned schema
+  (nullable, so `NULL` binds work). In `0.2.2.3`, values are inferred first and
+  safely cast: fractional floats/Decimals cannot silently truncate to integer
+  parameters and instead raise `DataError`. It executes the returned handle, and the
+  opt-in prepared-statement feature renders `$n` placeholders on SQLAlchemy 2
+  (an explicit `create_engine(..., paramstyle=...)` is honored instead).
+  In `0.2.2.4`, a complete `$1` through `$N` schema binds by numeric placeholder
+  index even when fields arrive in lexical order (`$1, $10, $2, ...`). Other
+  names remain positional. Integer-to-decimal binds infer exact Decimal value
+  precision before safe casting; string/binary views are built directly so
+  prepared view parameters work on the PyArrow 16 floor.
+  Servers that return no parameter schema, or declare union-typed parameters
+  (the Arrow SQLite example server's `dense_union<string, int64, double,
+  binary>`), keep the legacy one-dense-union-per-parameter binding.
+  The default literal path keeps qmark: SQLAlchemy's numeric paramstyles
+  rescan the post-compiled statement for `%(name)s`, which would corrupt
+  literal values containing that text. **Raw-fragment limitation:** this
+  upstream numeric rewrite also scans raw `text()` and `literal_column()` SQL.
+  In `0.2.2.4` those fragments containing `%(name)s` raise a clear `CompileError`
+  rather than a `KeyError` or silently changing a literal into `$n`. Pass such
+  strings as bound values, not raw SQL. SQLAlchemy 2 also rewrites raw tokens
+  for qmark, so the guard covers literal and prepared positional paramstyles; choosing
+  qmark is not an escape hatch for raw fragments.
+  The server cannot type a placeholder
+  that has no column context (`SELECT $1`); that is a server-side limit.
+- **Errors.** PyArrow/Flight failures are re-raised as PEP 249 exceptions
+  (`OperationalError` for unavailable/unauthenticated, `NotSupportedError` for
+  unimplemented, `ProgrammingError`/`InternalError`/`DatabaseError` otherwise)
+  with the original chained, so SQLAlchemy wraps them and pool pre-ping
+  recycles connections after a server restart. Only an unavailable server is
+  treated as a disconnect; authentication and cancellation errors are not.
+- **Exact numeric results.** The dialects use a dedicated Numeric result processor, so
+  `DECIMAL` and `uint64` (`NUMERIC(20, 0)`) values keep Arrow's exact
+  `Decimal`/`int` instead of being rounded through `float`. A `Numeric`
+  declared over a floating-point column still returns `Decimal`, and `Float`
+  still returns `float`. In `0.2.2.3`, SQLAlchemy Numeric/Float Decimal binds
+  again convert to float (the legacy behavior), independently of exact result
+  processing. Direct DB API typed decimal parameters retain Arrow decimal
+  precision; SQLAlchemy's float bind path does not promise exact decimal input.
+  Struct, map and
+  nested-list columns reflect as `JSON` and pass Arrow's dicts and lists
+  through unchanged. Non-finite float literals (`nan`, `inf`) do not compile;
+  bind them as parameters.
+- **No placeholder credentials.** Without a token or user/password no
+  `authorization` header is sent (previously `Bearer None`).
+
+Writes (DoPut CommandStatementUpdate), transactions and key reflection
+(GetPrimaryKeys) are unimplemented by that service and remain unsupported
+through it.
 
 Reflection treats a successful zero-row GetTables result as an empty catalog.
 If reported names exceed parseable included schemas, only the missing table keys
@@ -113,9 +224,9 @@ artifact URL together with its SHA-256. A PEP 508 direct reference to
 supported where a source pin is required instead.
 
 1. Record the internal fork version in `pyproject.toml` and
-   `flightsql/__init__.py` (currently `0.2.2.1`). Published artifacts are
+   `flightsql/__init__.py` (currently `0.2.2.4`). Published artifacts are
    immutable and are never rebuilt in place, so any subsequent change ships as
-   a new fourth component (`0.2.2.2`, and so on). The pipeline refuses to
+   a new fourth component (`0.2.2.5`, and so on). The pipeline refuses to
    overwrite an existing key rather than relying on this being remembered.
 2. Run the installed-wheel matrix and the reference-server suite, and merge the
    reviewed, green version change.

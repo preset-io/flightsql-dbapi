@@ -74,7 +74,7 @@ matches its bytes to the externally supplied digest; it does not trust optional
 installer `archive_info` and reports `commit_verified: false`. This verifies the
 referenced file, not a build linkage between that file and the installed tree.
 Do not publish this fork as `flightsql-dbapi` on a public package index. The
-internal fork version is `0.2.2.1`; see
+internal fork version is `0.2.2.4`; see
 [MAINTENANCE.md](MAINTENANCE.md) for the complete threat boundary and matrix.
 
 ## Usage
@@ -248,3 +248,27 @@ than silently weakening transport security. `insecure=true` and
 
 Any query parameters *not* specified in the above table will be sent to the
 upstream server as gRPC metadata.
+
+### Catalog URL migration (0.2.2.4)
+
+The URL path filters **reflection only**, not SQL execution. It must match the
+server's default catalog: the DataFusion dialect reads
+`datafusion.catalog.default_catalog` from `information_schema.df_settings` at
+connection initialization and rejects mismatches or an unverifiable default.
+**Server prerequisite:** enable `datafusion.catalog.information_schema=true`
+in the DataFusion session configuration before starting the Flight SQL service.
+DataFusion disables information-schema tables by default: a plain
+`SessionContext::new()` does not expose `information_schema.df_settings`, so
+even `/datafusion` fails to connect with "cannot verify the URL catalog".
+If the server cannot expose that setting, omit the URL path.
+Otherwise, a table reflected from `/cat2` could silently read a same-named table
+in the default catalog. Configure the server/session default before using another
+catalog; the dialect does not switch it. On InfluxDB use
+`datafusion://host:port?database=db1` for database request metadata, without `/db1`.
+Direct DB API `catalog=` only filters metadata and does not perform this check.
+
+In both literal and prepared mode with positional placeholders, raw `text()` or
+`literal_column()` fragments containing `%(name)s` are rejected with `CompileError`:
+SQLAlchemy would otherwise rewrite that text or raise `KeyError`. Pass these
+strings as bound values instead. See the
+[compatibility notes](MAINTENANCE.md#datafusion-flight-sql-service-compatibility).

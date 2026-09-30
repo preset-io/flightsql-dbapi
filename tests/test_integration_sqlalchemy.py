@@ -1,10 +1,13 @@
 import warnings
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from sqlalchemy import (
     Column,
+    Float,
     Integer,
+    Numeric,
     String,
     bindparam,
     create_engine,
@@ -22,6 +25,7 @@ import flightsql.flightsql_pb2 as flightsql
 from flightsql.sqlalchemy import FEATURE_PREPARED_STATEMENTS, LiteralBindCompiler
 
 from . import integration
+from .sqlalchemy_compat import with_bind_values
 
 
 def new_sqlalchemy_engine(features=None):
@@ -143,14 +147,14 @@ def test_integration_literal_binds_compile_string_is_directly_executable_and_esc
     statement = select(table.c.id).where(table.c["keyName"] == candidate).order_by(table.c.id)
 
     with engine.connect() as connection:
-        compiled = statement.params(candidate="one").compile(
+        compiled = with_bind_values(statement, candidate="one").compile(
             dialect=engine.dialect,
             compile_kwargs={"literal_binds": True},
         )
         assert "POSTCOMPILE" not in str(compiled)
         assert [row[0] for row in connection.exec_driver_sql(str(compiled))] == [1]
 
-        hostile = statement.params(candidate="one' OR 1=1 --").compile(
+        hostile = with_bind_values(statement, candidate="one' OR 1=1 --").compile(
             dialect=engine.dialect,
             compile_kwargs={"literal_binds": True},
         )
@@ -193,7 +197,7 @@ def test_integration_none_typed_binds_execute_as_sql_null_in_normal_and_literal_
 
     with engine.connect() as connection:
         assert [row[0] for row in connection.execute(statement, {"candidate": None})] == expected_ids
-        literal = statement.params(candidate=None).compile(
+        literal = with_bind_values(statement, candidate=None).compile(
             dialect=engine.dialect,
             compile_kwargs={"literal_binds": True},
         )
@@ -302,7 +306,7 @@ def test_integration_dialect_basic_orm_with_prepared_statements():
     # Connect to ensure we're using the default compiler.
     with engine.connect():
         pass
-    assert engine.dialect.statement_compiler == compiler.SQLCompiler
+    assert issubclass(engine.dialect.statement_compiler, compiler.SQLCompiler)
 
     class Record(base):
         __tablename__ = Table("intTable", metadata, autoload_with=engine)
@@ -317,3 +321,25 @@ def test_integration_dialect_basic_orm_with_prepared_statements():
     assert [r.value for r in results] == [1, 0, -1]
     session.close()
     engine.dispose()
+
+
+@pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)
+@pytest.mark.parametrize("type_", [Numeric(10, 2), Float()])
+def test_integration_prepared_decimal_bind(type_):
+    host, port = integration.host_port()
+    engine = create_engine(
+        URL.create(
+            "datafusion",
+            host=host,
+            port=port,
+            query={"insecure": "true", "feature-sqlalchemy-prepared-statements": "on"},
+        ),
+        paramstyle="qmark",
+    )
+    table = Table("intTable", MetaData(), Column("id", Integer), Column("value", type_))
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(select(table.c.id).where(table.c.value > Decimal("0.5"))).all()
+        assert rows == [(1,)]
+    finally:
+        engine.dispose()
