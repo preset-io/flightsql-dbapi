@@ -498,11 +498,13 @@ def test_url_catalog_is_checked_against_execution_default(monkeypatch, catalog):
 
     connection = SimpleNamespace(connection=dbapi, exec_driver_sql=execute)
     if catalog == "cat2":
-        with pytest.raises(sqlalchemy.exc.InvalidRequestError, match="server's default catalog"):
+        with pytest.raises(sqlalchemy.exc.InvalidRequestError, match="must match.*server's default catalog"):
             DataFusionDialect().initialize(connection)
     else:
         DataFusionDialect().initialize(connection)
-    assert queries == ["SELECT current_catalog()"]
+    assert queries == [
+        "SELECT value FROM information_schema.df_settings WHERE name = 'datafusion.catalog.default_catalog'"
+    ]
 
 
 def test_url_catalog_fails_closed_when_default_cannot_be_verified(monkeypatch):
@@ -511,7 +513,9 @@ def test_url_catalog_fails_closed_when_default_cannot_be_verified(monkeypatch):
     dbapi.catalog = "unknown"
 
     def execute(query):
-        raise sqlalchemy.exc.NotSupportedError(query, {}, flightsql.NotSupportedError("current_catalog unsupported"))
+        raise sqlalchemy.exc.NotSupportedError(
+            query, {}, flightsql.NotSupportedError("default catalog discovery unsupported")
+        )
 
     with pytest.raises(sqlalchemy.exc.InvalidRequestError, match="cannot verify.*catalog"):
         DataFusionDialect().initialize(SimpleNamespace(connection=dbapi, exec_driver_sql=execute))

@@ -590,11 +590,13 @@ class DataFusionDialect(FlightSQLDialect):
             # A Flight SQL metadata filter does not change the SQL session.
             # Fail closed rather than reflect one catalog and query another.
             try:
-                default_catalog = connection.exec_driver_sql("SELECT current_catalog()").scalar()
+                default_catalog = connection.exec_driver_sql(
+                    "SELECT value FROM information_schema.df_settings WHERE name = 'datafusion.catalog.default_catalog'"
+                ).scalar()
             except exc.DBAPIError as error:
                 raise exc.InvalidRequestError(
                     "cannot verify the URL catalog against the server's default catalog; "
-                    "omit the URL path when current_catalog() is unsupported"
+                    "omit the URL path when default catalog discovery is unsupported"
                 ) from error
             if catalog != default_catalog:
                 raise exc.InvalidRequestError(

@@ -252,7 +252,8 @@ upstream server as gRPC metadata.
 ### Catalog URL migration (0.2.2.4)
 
 The URL path filters **reflection only**, not SQL execution. It must match the
-server's default catalog: the DataFusion dialect checks `current_catalog()` at
+server's default catalog: the DataFusion dialect reads
+`datafusion.catalog.default_catalog` from `information_schema.df_settings` at
 connection initialization and rejects mismatches or an unverifiable default.
 Otherwise, a table reflected from `/cat2` could silently read a same-named table
 in the default catalog. Configure the server/session default before using another

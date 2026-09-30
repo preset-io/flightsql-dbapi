@@ -97,7 +97,8 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   **Execution safety (0.2.2.4):** the URL path is only a reflection filter;
   it does not change the server's SQL execution catalog or qualify SQL table
   names. It must equal the server's default catalog. The DataFusion dialect
-  checks `SELECT current_catalog()` at initialization when a path is supplied,
+  reads `datafusion.catalog.default_catalog` from `information_schema.df_settings`
+  at initialization when a path is supplied,
   rejecting mismatches before any reflected table can query the wrong catalog.
   If the server cannot report its default, initialization fails closed: omit
   the path rather than using an unverified reflection filter. To use another
