@@ -300,7 +300,6 @@ class Connection:
             except (flight.FlightError, pa.ArrowInvalid):
                 # This is an advisory probe after a successful empty response,
                 # not the original metadata request. Preserve that response.
-                self._resolved_catalog = (None,)
                 return False
             if answers_unscoped:
                 # The server answers unscoped requests; the empty answer stands.
@@ -319,7 +318,7 @@ class Connection:
                 resolved = catalogs[0]
         except (pa.ArrowNotImplementedError, flight.FlightError, pa.ArrowInvalid):
             # Include DoGet/read failures in the best-effort catalog probe.
-            pass
+            return False
         self._resolved_catalog = (resolved,)
         return resolved is not None
 

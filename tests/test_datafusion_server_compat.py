@@ -545,26 +545,30 @@ def test_prepared_raw_pyformat_fragments_fail_clearly_without_rewriting(fragment
 def test_failed_fallback_probes_preserve_successful_empty_metadata(rpc, error_type):
     class BrokenProbeClient(CatalogScopedClient):
         def get_db_schemas(self, **kwargs):
-            if rpc == "get_db_schemas":
+            if self.fail and rpc == "get_db_schemas":
                 raise error_type("probe failed")
             return super().get_db_schemas(**kwargs)
 
         def get_catalogs(self):
-            if rpc == "get_catalogs":
+            if self.fail and rpc == "get_catalogs":
                 raise error_type("probe failed")
             return super().get_catalogs()
 
         def do_get(self, ticket):
-            if ticket[0] == "catalogs" and rpc == "catalog_do_get":
+            if self.fail and ticket[0] == "catalogs" and rpc == "catalog_do_get":
                 raise error_type("probe stream failed")
             return super().do_get(ticket)
 
     client = BrokenProbeClient()
+    client.fail = True
     conn = Connection(client)
     assert conn.flightsql_get_table_names("missing") == []
     assert conn._metadata_catalog() is None
-    # An advisory probe failure must not scope future metadata requests.
-    assert conn.flightsql_get_table_names("missing") == []
+    assert conn._resolved_catalog is None
+    # Once the transient failure clears, the same connection retries discovery.
+    client.fail = False
+    assert conn.flightsql_get_table_names("public") == ["orders", "east_orders"]
+    assert conn.flightsql_get_schema_names() == ["information_schema", "public"]
 
 
 def test_primary_metadata_error_is_not_swallowed_as_a_fallback_failure():
