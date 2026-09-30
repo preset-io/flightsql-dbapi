@@ -284,9 +284,9 @@ class Connection:
         An empty answer to a filtered request (e.g. a schema with no tables)
         is not evidence of that, so the decision rests on the unfiltered,
         unscoped GetDbSchemas: only when it is empty is one catalog resolved
-        from GetCatalogs -- DataFusion's default ``datafusion`` if present,
-        else the only catalog. The outcome is a property of the server and is
-        decided once per connection; the return value says whether the caller
+        from GetCatalogs -- the only catalog, or the execution default reported
+        by DataFusion session settings when several catalogs exist. Successful
+        discovery is cached per connection; failed advisory probes are retried; the return value says whether the caller
         should retry scoped to the resolved catalog. A server without
         GetCatalogs keeps the unscoped (empty) answer.
         """
@@ -312,10 +312,18 @@ class Connection:
             for table in self._tables_from_info(info):
                 if "catalog_name" in table.column_names:
                     catalogs.extend(name for name in table.column("catalog_name").to_pylist() if name)
-            if "datafusion" in catalogs:
-                resolved = "datafusion"
-            elif len(set(catalogs)) == 1:
+            if len(set(catalogs)) == 1:
                 resolved = catalogs[0]
+            elif catalogs:
+                # A catalog named "datafusion" need not be the SQL default.
+                # Never guess among multiple catalogs: reflection and unqualified
+                # execution must use the same namespace.
+                info = self.client.execute(
+                    "SELECT value FROM information_schema.df_settings WHERE name = 'datafusion.catalog.default_catalog'"
+                )
+                values = [row["value"] for table in self._tables_from_info(info) for row in table.to_pylist()]
+                if len(values) == 1 and isinstance(values[0], str) and values[0] in catalogs:
+                    resolved = values[0]
         except (pa.ArrowNotImplementedError, flight.FlightError, pa.ArrowInvalid):
             # Include DoGet/read failures in the best-effort catalog probe.
             return False

@@ -40,10 +40,15 @@ class CatalogScopedClient:
 
     features = {}
 
-    def __init__(self, catalogs=("datafusion",), get_catalogs_implemented=True):
+    def __init__(self, catalogs=("datafusion",), get_catalogs_implemented=True, default_catalog="datafusion"):
         self.catalogs = list(catalogs)
         self.get_catalogs_implemented = get_catalogs_implemented
         self.calls = []
+        self.default_catalog = default_catalog
+
+    def execute(self, query):
+        self.calls.append(("execute", {"query": query}))
+        return _endpoint_info(("settings", None))
 
     def get_catalogs(self):
         self.calls.append(("get_catalogs", {}))
@@ -61,7 +66,9 @@ class CatalogScopedClient:
 
     def do_get(self, ticket):
         kind, catalog = ticket
-        if kind == "catalogs":
+        if kind == "settings":
+            table = pa.table({"value": pa.array([self.default_catalog], pa.string())})
+        elif kind == "catalogs":
             table = pa.table({"catalog_name": pa.array(self.catalogs, pa.string())})
         elif catalog != "datafusion":
             table = pa.table({"db_schema_name": pa.array([], pa.string())})
@@ -100,7 +107,7 @@ def test_single_catalog_is_used_and_ambiguous_catalogs_stay_unscoped():
     assert Connection(CatalogScopedClient(catalogs=["datafusion"])).flightsql_get_schema_names()
     ambiguous = CatalogScopedClient(catalogs=["a", "b"])
     assert Connection(ambiguous).flightsql_get_schema_names() == []
-    assert all("catalog" not in kwargs for name, kwargs in ambiguous.calls if name != "get_catalogs")
+    assert all("catalog" not in kwargs for name, kwargs in ambiguous.calls if name not in ("get_catalogs", "execute"))
 
 
 def test_server_without_get_catalogs_keeps_the_unscoped_answer():
@@ -275,7 +282,9 @@ class CompliantCatalogClient(CatalogScopedClient):
     def do_get(self, ticket):
         kind, catalog = ticket
         rows = [value for name, value in self.TABLES.items() if catalog in (None, name)]
-        if kind == "catalogs":
+        if kind == "settings":
+            table = pa.table({"value": pa.array([self.default_catalog], pa.string())})
+        elif kind == "catalogs":
             return SimpleNamespace(read_all=lambda: pa.table({"catalog_name": list(self.TABLES)}))
         if kind == "schemas":
             return SimpleNamespace(
@@ -609,3 +618,65 @@ def test_raw_pyformat_fragment_also_rejects_qmark_rewriting():
     with pytest.raises(sqlalchemy.exc.CompileError, match="raw.*bind parameter"):
         select(sqlalchemy.literal_column("'%(x)s'"), bindparam("x", 1)).compile(dialect=engine.dialect)
     engine.dispose()
+
+
+@pytest.mark.parametrize("metadata", ["schemas", "tables"])
+def test_multiple_catalogs_use_execution_default_not_datafusion(metadata):
+    class OtherDefaultClient(CatalogScopedClient):
+        def do_get(self, ticket):
+            kind, catalog = ticket
+            if catalog == "cat2":
+                if kind == "schemas":
+                    table = pa.table({"db_schema_name": ["public"]})
+                else:
+                    table = pa.table({"table_name": ["t"], "table_type": ["BASE TABLE"]})
+                return SimpleNamespace(read_all=lambda: table)
+            return super().do_get(ticket)
+
+    client = OtherDefaultClient(catalogs=["datafusion", "cat2"], default_catalog="cat2")
+    conn = Connection(client)
+    if metadata == "schemas":
+        assert conn.flightsql_get_schema_names() == ["public"]
+    else:
+        assert conn.flightsql_get_table_names("public") == ["t"]
+    assert conn._metadata_catalog() == "cat2"
+    assert conn.flightsql_get_table_names("public") == ["t"]
+    assert len([call for call in client.calls if call[0] == "execute"]) == 1
+
+
+@pytest.mark.parametrize("default", [None, "missing", ""])
+def test_multiple_catalogs_without_verified_default_never_guess_datafusion(default):
+    conn = Connection(CatalogScopedClient(catalogs=["datafusion", "cat2"], default_catalog=default))
+    assert conn.flightsql_get_schema_names() == []
+    assert conn._metadata_catalog() is None
+
+
+@pytest.mark.parametrize("rpc", ["execute", "settings_do_get", "settings_read"])
+@pytest.mark.parametrize("error_type", [pa.ArrowNotImplementedError, pa.ArrowInvalid, flight.FlightUnavailableError])
+def test_failed_default_catalog_discovery_stays_unscoped_and_retries(rpc, error_type):
+    class BrokenSettingsClient(CatalogScopedClient):
+        fail = True
+
+        def execute(self, query):
+            if self.fail and rpc == "execute":
+                raise error_type("settings unavailable")
+            return super().execute(query)
+
+        def do_get(self, ticket):
+            if self.fail and ticket[0] == "settings":
+                if rpc == "settings_do_get":
+                    raise error_type("settings stream unavailable")
+                if rpc == "settings_read":
+
+                    def read_all():
+                        raise error_type("settings read failed")
+
+                    return SimpleNamespace(read_all=read_all)
+            return super().do_get(ticket)
+
+    client = BrokenSettingsClient(catalogs=["datafusion", "cat2"])
+    conn = Connection(client)
+    assert conn.flightsql_get_table_names("public") == []
+    assert conn._resolved_catalog is None
+    client.fail = False
+    assert conn.flightsql_get_table_names("public") == ["orders", "east_orders"]
