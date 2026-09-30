@@ -94,20 +94,28 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   (`datafusion://host:port/<catalog>`) scopes every metadata RPC. **This is a
   change for every server using these dialects:** the URL database used to be
   ignored, and now filters reflection to that catalog with no fallback.
-  **Migration warning:** a nonexistent or inaccessible catalog can return an
-  empty reflection result without an error. For example, on InfluxDB,
-  `datafusion://h:p/db1?database=db1` can reflect `[]`: the path is a Flight SQL
-  catalog filter, while `database=db1` is server request metadata, not a catalog.
-  Use `datafusion://h:p?database=db1` unless `db1` is an advertised catalog.
-  We deliberately retain empty-result semantics rather than raising/warning:
-  an empty, permission-filtered, or nonexistent catalog cannot reliably be
-  distinguished from a successful zero-row metadata response.
+  **Execution safety (0.2.2.4):** the URL path is only a reflection filter;
+  it does not change the server's SQL execution catalog or qualify SQL table
+  names. It must equal the server's default catalog. The DataFusion dialect
+  checks `SELECT current_catalog()` at initialization when a path is supplied,
+  rejecting mismatches before any reflected table can query the wrong catalog.
+  If the server cannot report its default, initialization fails closed: omit
+  the path rather than using an unverified reflection filter. To use another
+  catalog, configure that default on the server/session first; this dialect
+  does not switch it for you. Raw SQL can use fully qualified table names.
+  On InfluxDB use `datafusion://h:p?database=db1`: `database=db1` is request
+  metadata, not a Flight SQL catalog. Direct DB API `catalog=` and custom
+  FlightSQL dialects still only filter metadata and can return empty reflection
+  without an error; their callers must keep execution and reflection aligned.
   Without one, an empty unscoped answer is checked against the unfiltered,
   unscoped GetDbSchemas. Only when that is empty too (the server cannot
   answer unscoped) does the connection resolve one catalog via GetCatalogs
   (`datafusion` if present, else the only catalog) and retry scoped. A
   legitimately empty answer from a compliant server (such as a schema with no
   tables) costs one extra GetDbSchemas and never scopes the connection.
+  Flight/INVALID_ARGUMENT failures in the advisory fallback probes (including
+  their streams) preserve the successful empty response and leave the connection
+  unscoped. Failures of the original metadata request still propagate.
 - **Views are reported with `table_type = VIEW`.** `get_table_names()` excludes
   them, `get_view_names()` lists them, and `has_table()` covers both.
 - **Strings arrive as Utf8View.** Arrow string, binary and list view types map
@@ -124,12 +132,24 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   parameters and instead raise `DataError`. It executes the returned handle, and the
   opt-in prepared-statement feature renders `$n` placeholders on SQLAlchemy 2
   (an explicit `create_engine(..., paramstyle=...)` is honored instead).
+  In `0.2.2.4`, a complete `$1` through `$N` schema binds by numeric placeholder
+  index even when fields arrive in lexical order (`$1, $10, $2, ...`). Other
+  names remain positional. Integer-to-decimal binds infer exact Decimal value
+  precision before safe casting; string/binary views are built directly so
+  prepared view parameters work on the PyArrow 16 floor.
   Servers that return no parameter schema, or declare union-typed parameters
   (the Arrow SQLite example server's `dense_union<string, int64, double,
   binary>`), keep the legacy one-dense-union-per-parameter binding.
   The default literal path keeps qmark: SQLAlchemy's numeric paramstyles
   rescan the post-compiled statement for `%(name)s`, which would corrupt
-  literal values containing that text. The server cannot type a placeholder
+  literal values containing that text. **Prepared-path limitation:** this
+  upstream numeric rewrite also scans raw `text()` and `literal_column()` SQL.
+  In `0.2.2.4` those fragments containing `%(name)s` raise a clear `CompileError`
+  rather than a `KeyError` or silently changing a literal into `$n`. Pass such
+  strings as bound values, not raw SQL. SQLAlchemy 2 also rewrites raw tokens
+  for qmark, so the guard covers all positional prepared paramstyles; choosing
+  qmark is not an escape hatch for raw fragments.
+  The server cannot type a placeholder
   that has no column context (`SELECT $1`); that is a server-side limit.
 - **Errors.** PyArrow/Flight failures are re-raised as PEP 249 exceptions
   (`OperationalError` for unavailable/unauthenticated, `NotSupportedError` for
@@ -194,9 +214,9 @@ artifact URL together with its SHA-256. A PEP 508 direct reference to
 supported where a source pin is required instead.
 
 1. Record the internal fork version in `pyproject.toml` and
-   `flightsql/__init__.py` (currently `0.2.2.3`). Published artifacts are
+   `flightsql/__init__.py` (currently `0.2.2.4`). Published artifacts are
    immutable and are never rebuilt in place, so any subsequent change ships as
-   a new fourth component (`0.2.2.4`, and so on). The pipeline refuses to
+   a new fourth component (`0.2.2.5`, and so on). The pipeline refuses to
    overwrite an existing key rather than relying on this being remembered.
 2. Run the installed-wheel matrix and the reference-server suite, and merge the
    reviewed, green version change.

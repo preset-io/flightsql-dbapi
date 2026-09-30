@@ -306,7 +306,7 @@ def test_integration_dialect_basic_orm_with_prepared_statements():
     # Connect to ensure we're using the default compiler.
     with engine.connect():
         pass
-    assert engine.dialect.statement_compiler == compiler.SQLCompiler
+    assert issubclass(engine.dialect.statement_compiler, compiler.SQLCompiler)
 
     class Record(base):
         __tablename__ = Table("intTable", metadata, autoload_with=engine)

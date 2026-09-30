@@ -444,3 +444,160 @@ def test_typed_parameter_preserves_exact_numeric_values(value, target):
 def test_typed_integer_parameter_rejects_overflow(value):
     with pytest.raises(flightsql.DataError, match="cannot bind.*int64"):
         build_parameter_record((value,), pa.schema([("$1", pa.int64())]))
+
+
+def test_numbered_parameter_schema_binds_by_index_not_lexical_order():
+    values = (20, 2, 3, 4, 5, 6, 7, 8, 9, "ten", Decimal("11.25"))
+    fields = [pa.field(f"${i}", pa.int64()) for i in range(1, 10)]
+    fields += [pa.field("$10", pa.string()), pa.field("$11", pa.decimal128(10, 2))]
+    schema = pa.schema(sorted(fields, key=lambda field: field.name), metadata={b"source": b"server"})
+    record = build_parameter_record(values, schema)
+    assert record.to_pylist() == [{f"${i}": value for i, value in enumerate(values, 1)}]
+    assert record.schema == schema
+    assert record.schema.metadata == schema.metadata
+
+
+@pytest.mark.parametrize("names", [("$2", "$1"), ("b", "a"), ("$2", "$2"), ("$0", "$1"), ("$2", "other")])
+def test_only_complete_numbered_schemas_change_positional_binding(names):
+    record = build_parameter_record((10, 20), pa.schema([(name, pa.int64()) for name in names]))
+    expected = [20, 10] if names == ("$2", "$1") else [10, 20]
+    assert [column[0].as_py() for column in record.columns] == expected
+
+
+@pytest.mark.parametrize("value", [100, -100, 0, 2**64 - 1])
+def test_integer_binds_to_decimal_using_value_precision(value):
+    target = pa.decimal128(22, 2) if value > 100 else pa.decimal128(10, 2)
+    record = build_parameter_record((value,), pa.schema([("$1", target)]))
+    assert record.column(0)[0].as_py() == Decimal(value)
+
+
+@pytest.mark.parametrize("value", [1000, -1000])
+def test_integer_decimal_bind_still_rejects_insufficient_precision(value):
+    with pytest.raises(flightsql.DataError):
+        build_parameter_record((value,), pa.schema([("$1", pa.decimal128(4, 2))]))
+
+
+@pytest.mark.parametrize("type_,value", [(pa.string_view(), "héllo"), (pa.binary_view(), b"\x00\xff")])
+def test_view_parameter_binds_on_arrow_floor(type_, value):
+    for item in (value, None):
+        record = build_parameter_record((item,), pa.schema([("$1", type_)]))
+        assert record.schema.types == [type_]
+        assert record.to_pylist() == [{"$1": item}]
+
+
+@pytest.mark.parametrize("catalog", ["cat2", "datafusion"])
+def test_url_catalog_is_checked_against_execution_default(monkeypatch, catalog):
+    monkeypatch.setattr(sqlalchemy.engine.default.DefaultDialect, "initialize", lambda self, connection: None)
+    dbapi = _SqlInfoUnimplemented()
+    dbapi.catalog = catalog
+    queries = []
+
+    def execute(query):
+        queries.append(query)
+        return SimpleNamespace(scalar=lambda: "datafusion")
+
+    connection = SimpleNamespace(connection=dbapi, exec_driver_sql=execute)
+    if catalog == "cat2":
+        with pytest.raises(sqlalchemy.exc.InvalidRequestError, match="server's default catalog"):
+            DataFusionDialect().initialize(connection)
+    else:
+        DataFusionDialect().initialize(connection)
+    assert queries == ["SELECT current_catalog()"]
+
+
+def test_url_catalog_fails_closed_when_default_cannot_be_verified(monkeypatch):
+    monkeypatch.setattr(sqlalchemy.engine.default.DefaultDialect, "initialize", lambda self, connection: None)
+    dbapi = _SqlInfoUnimplemented()
+    dbapi.catalog = "unknown"
+
+    def execute(query):
+        raise sqlalchemy.exc.NotSupportedError(query, {}, flightsql.NotSupportedError("current_catalog unsupported"))
+
+    with pytest.raises(sqlalchemy.exc.InvalidRequestError, match="cannot verify.*catalog"):
+        DataFusionDialect().initialize(SimpleNamespace(connection=dbapi, exec_driver_sql=execute))
+
+
+@pytest.mark.skipif(not SQLALCHEMY_2, reason="numeric_dollar requires SQLAlchemy 2")
+@pytest.mark.parametrize("fragment", ["text", "literal_column"])
+@pytest.mark.parametrize("name", ["x", "actual"])
+def test_prepared_raw_pyformat_fragments_fail_clearly_without_rewriting(fragment, name):
+    engine = sqlalchemy.create_engine(
+        URL.create(
+            "datafusion",
+            host="localhost",
+            port=1,
+            query={"insecure": "true", "feature-sqlalchemy-prepared-statements": "on"},
+        )
+    )
+    expr = (sqlalchemy.text if fragment == "text" else sqlalchemy.literal_column)(f"'%({name})s'")
+    stmt = select(expr, bindparam("actual", "value"))
+    with pytest.raises(sqlalchemy.exc.CompileError, match="raw.*%.*bind parameter"):
+        stmt.compile(dialect=engine.dialect)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("rpc", ["get_db_schemas", "get_catalogs", "catalog_do_get"])
+@pytest.mark.parametrize("error_type", [flight.FlightInternalError, pa.ArrowInvalid, flight.FlightUnavailableError])
+def test_failed_fallback_probes_preserve_successful_empty_metadata(rpc, error_type):
+    class BrokenProbeClient(CatalogScopedClient):
+        def get_db_schemas(self, **kwargs):
+            if rpc == "get_db_schemas":
+                raise error_type("probe failed")
+            return super().get_db_schemas(**kwargs)
+
+        def get_catalogs(self):
+            if rpc == "get_catalogs":
+                raise error_type("probe failed")
+            return super().get_catalogs()
+
+        def do_get(self, ticket):
+            if ticket[0] == "catalogs" and rpc == "catalog_do_get":
+                raise error_type("probe stream failed")
+            return super().do_get(ticket)
+
+    client = BrokenProbeClient()
+    conn = Connection(client)
+    assert conn.flightsql_get_table_names("missing") == []
+    assert conn._metadata_catalog() is None
+    # An advisory probe failure must not scope future metadata requests.
+    assert conn.flightsql_get_table_names("missing") == []
+
+
+def test_primary_metadata_error_is_not_swallowed_as_a_fallback_failure():
+    class BrokenTablesClient(CatalogScopedClient):
+        def get_tables(self, **kwargs):
+            raise flight.FlightInternalError("primary GetTables failed")
+
+    with pytest.raises(flightsql.InternalError, match="primary GetTables failed"):
+        Connection(BrokenTablesClient()).flightsql_get_table_names("missing")
+
+
+@pytest.mark.skipif(not SQLALCHEMY_2, reason="numeric_dollar requires SQLAlchemy 2")
+def test_prepared_pyformat_string_is_safe_as_a_bound_value():
+    engine = sqlalchemy.create_engine(
+        URL.create(
+            "datafusion",
+            host="localhost",
+            port=1,
+            query={"insecure": "true", "feature-sqlalchemy-prepared-statements": "on"},
+        )
+    )
+    compiled = select(bindparam("actual", "%(actual)s")).compile(dialect=engine.dialect)
+    assert compiled.params == {"actual": "%(actual)s"}
+    assert "$1" in str(compiled)
+    engine.dispose()
+
+
+def test_raw_pyformat_fragment_also_rejects_qmark_rewriting():
+    engine = sqlalchemy.create_engine(
+        URL.create(
+            "datafusion",
+            host="localhost",
+            port=1,
+            query={"insecure": "true", "feature-sqlalchemy-prepared-statements": "on"},
+        ),
+        paramstyle="qmark",
+    )
+    with pytest.raises(sqlalchemy.exc.CompileError, match="raw.*bind parameter"):
+        select(sqlalchemy.literal_column("'%(x)s'"), bindparam("x", 1)).compile(dialect=engine.dialect)
+    engine.dispose()

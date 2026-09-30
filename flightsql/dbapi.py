@@ -1,9 +1,11 @@
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.ipc as ipc
+from pyarrow import flight
 from sqlalchemy import types
 
 from flightsql.client import FlightSQLClient, TableRef
@@ -295,6 +297,11 @@ class Connection:
                 answers_unscoped = bool(self._schema_names(None))
             except pa.ArrowNotImplementedError:
                 answers_unscoped = False  # no GetDbSchemas: cannot tell, try GetCatalogs
+            except (flight.FlightError, pa.ArrowInvalid):
+                # This is an advisory probe after a successful empty response,
+                # not the original metadata request. Preserve that response.
+                self._resolved_catalog = (None,)
+                return False
             if answers_unscoped:
                 # The server answers unscoped requests; the empty answer stands.
                 self._resolved_catalog = (None,)
@@ -302,9 +309,6 @@ class Connection:
         resolved: Optional[str] = None
         try:
             info = self.client.get_catalogs()
-        except pa.ArrowNotImplementedError:
-            info = None
-        if info is not None:
             catalogs: List[str] = []
             for table in self._tables_from_info(info):
                 if "catalog_name" in table.column_names:
@@ -313,6 +317,9 @@ class Connection:
                 resolved = "datafusion"
             elif len(set(catalogs)) == 1:
                 resolved = catalogs[0]
+        except (pa.ArrowNotImplementedError, flight.FlightError, pa.ArrowInvalid):
+            # Include DoGet/read failures in the best-effort catalog probe.
+            pass
         self._resolved_catalog = (resolved,)
         return resolved is not None
 
@@ -857,15 +864,31 @@ def build_parameter_record(values: ExecuteParams, parameter_schema: Optional[pa.
         or any(pa.types.is_union(field.type) for field in parameter_schema)
     ):
         return ParameterRecordBuilder(values).build_record()
+    # DataFusion may return $1, $10, $11, $2, ... (lexical order).
+    # Preserve its schema order, but fetch each value by placeholder index.
+    # Generic/qmark or incomplete/duplicate names remain positional.
+    numbered = set(parameter_schema.names) == {f"${i}" for i in range(1, len(values) + 1)}
     arrays = []
-    for value, field in zip(values, parameter_schema):
+    for position, field in enumerate(parameter_schema):
+        value = values[int(field.name[1:]) - 1 if numbered else position]
         try:
             # Construct without a target type first: pa.array(..., type=...)
             # silently truncates fractional float/Decimal values for integers.
             # Arrow infers signed int64 for Python ints, even above its range.
             # Preserve uint64 inputs without converting them through float.
-            source_type = pa.uint64() if isinstance(value, int) and value >= 2**63 else None
-            arrays.append(pa.array([value], type=source_type).cast(field.type, safe=True))
+            if pa.types.is_decimal(field.type) and isinstance(value, int) and not isinstance(value, bool):
+                # int64 -> decimal checks the entire int64 range, not this
+                # value. Infer precision from an exact Decimal instead.
+                source_value = Decimal(value)
+            else:
+                source_value = value
+            source_type = pa.uint64() if isinstance(source_value, int) and source_value >= 2**63 else None
+            if _is_type(field.type, "is_string_view") or _is_type(field.type, "is_binary_view"):
+                # Arrow 16 supports constructing views but cannot cast to them.
+                # Direct construction cannot truncate numeric values here.
+                arrays.append(pa.array([source_value], type=field.type))
+            else:
+                arrays.append(pa.array([source_value], type=source_type).cast(field.type, safe=True))
         except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, OverflowError) as error:
             raise DataError(
                 f"cannot bind {type(value).__name__} value to parameter {field.name!r} of type {field.type}"

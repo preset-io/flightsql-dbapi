@@ -2,6 +2,7 @@ import datetime
 import decimal
 import inspect
 import math
+import re
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, MutableMapping, Sequence, Tuple
@@ -500,6 +501,26 @@ class LiteralBindCompiler(compiler.SQLCompiler):
         return super().render_literal_value(value, type_)
 
 
+class PreparedStatementCompiler(compiler.SQLCompiler):
+    """Reject raw pyformat tokens before SQLAlchemy's positional rewrite sees them."""
+
+    def _check_raw_prepared_fragment(self, text):
+        if self.dialect.positional and re.search(r"%\([^)]+\)s", text):
+            raise exc.CompileError(
+                "raw SQL containing %(name)s is unsafe with positional prepared parameters; "
+                "pass the string as a bind parameter instead"
+            )
+
+    def visit_textclause(self, textclause, **kwargs):
+        self._check_raw_prepared_fragment(textclause.text)
+        return super().visit_textclause(textclause, **kwargs)
+
+    def visit_column(self, column, *args, **kwargs):
+        if column.is_literal:
+            self._check_raw_prepared_fragment(column.name)
+        return super().visit_column(column, *args, **kwargs)
+
+
 class DataFusionDialect(FlightSQLDialect):
     """
     DataFusionDialect is a SQLAlchemy Dialect that uses Flight SQL as its
@@ -512,6 +533,7 @@ class DataFusionDialect(FlightSQLDialect):
     """
 
     name = "datafusion"
+    statement_compiler = PreparedStatementCompiler
 
     paramstyle = "qmark"
 
@@ -561,7 +583,24 @@ class DataFusionDialect(FlightSQLDialect):
         if prepared_statements_enabled != "on":
             self.statement_compiler = LiteralBindCompiler
         else:
-            self.statement_compiler = compiler.SQLCompiler
+            self.statement_compiler = PreparedStatementCompiler
+
+        catalog = getattr(connection.connection, "catalog", None)
+        if catalog is not None:
+            # A Flight SQL metadata filter does not change the SQL session.
+            # Fail closed rather than reflect one catalog and query another.
+            try:
+                default_catalog = connection.exec_driver_sql("SELECT current_catalog()").scalar()
+            except exc.DBAPIError as error:
+                raise exc.InvalidRequestError(
+                    "cannot verify the URL catalog against the server's default catalog; "
+                    "omit the URL path when current_catalog() is unsupported"
+                ) from error
+            if catalog != default_catalog:
+                raise exc.InvalidRequestError(
+                    f"URL catalog {catalog!r} must match the server's default catalog {default_catalog!r}; "
+                    "the URL path filters reflection only and does not select the execution catalog"
+                )
 
 
 registry.register("datafusion.flightsql", "flightsql.sqlalchemy", "DataFusionDialect")
