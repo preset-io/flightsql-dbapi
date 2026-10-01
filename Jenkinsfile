@@ -57,6 +57,12 @@
 //                    No S3 access, credential binding or index publication.
 //                    Local versions match ==0.2.2.4 and sort above it, so
 //                    immutable PR URLs in the shared index are NOT safe here.
+//   * other refs  -> 0.2.2.4+branch.<name>.<shortsha>: any non-main branch
+//                    (or tag) job, e.g. the branch job a multibranch project
+//                    creates alongside an origin PR.  Treated exactly like a
+//                    PR: build, test and verify, never publish.  The stable
+//                    version is never built off main, so it cannot be
+//                    published from any other ref.
 //
 // A four-component version is used rather than a PEP 440 local version such as
 // 0.2.3+preset.2 because a local version is MATCHED by the corresponding
@@ -173,11 +179,27 @@ podTemplate(
                     // assertion fails if backend normalisation changes.
                     String localSegment = "${env.BRANCH_NAME}.${shortGitRev}".toLowerCase().replaceAll(/[-_]/, '.')
                     publishVersion = "${baseVersion}+${localSegment}"
+                } else if (!isMain) {
+                    // Any other ref builds and verifies as a local test
+                    // version instead of failing, so an ordinary branch push
+                    // gets a real build signal.  Branch names may contain
+                    // characters PEP 440 rejects ('/', '@', ...), so every
+                    // run of them becomes '.'.  Numeric components are
+                    // written without leading zeros, as the backend
+                    // normalises them, so the predicted filename stays exact.
+                    // The 'branch' prefix keeps it distinct from a PR build.
+                    String localSegment = "branch.${env.BRANCH_NAME}.${shortGitRev}".toLowerCase()
+                            .replaceAll(/[^a-z0-9]+/, '.')
+                            .replaceAll(/^\.|\.$/, '')
+                            .replaceAll(/(^|\.)0+(?=[0-9]+(\.|$))/, '$1')
+                    publishVersion = "${baseVersion}+${localSegment}"
                 } else {
                     publishVersion = baseVersion
                 }
 
                 // A stable release may only come from reviewed, merged history.
+                // Unreachable by construction above; kept as a fail-closed
+                // invariant so a future edit cannot build stable off main.
                 if (!isMain && publishVersion == baseVersion) {
                     error("Refusing to build stable version ${baseVersion} from branch " +
                           "'${env.BRANCH_NAME}'. Stable releases are published only from main.")
@@ -252,7 +274,7 @@ podTemplate(
 
         container('py-ci') {
             stage('Build and verify reproducibility') {
-                if (isPullRequest) {
+                if (!isMain) {
                     // Both files are rewritten together: scripts/lint-version
                     // ties them, and the artifact identity depends on both.
                     sh(
@@ -401,6 +423,12 @@ EOF
                 if (!publishes) {
                     echo 'No explicit main release requested; built and verified only, without publication.'
                     return
+                }
+                // Fail closed even if the derivation above is ever changed:
+                // only main may publish, and only the declared stable version.
+                if (!isMain || publishVersion != baseVersion || publishVersion.contains('+')) {
+                    error("Refusing to publish ${publishVersion} from '${env.BRANCH_NAME}'. " +
+                          "Stable releases are published only from main.")
                 }
                 withCredentials([
                     [

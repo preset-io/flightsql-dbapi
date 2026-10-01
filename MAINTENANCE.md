@@ -234,7 +234,10 @@ supported where a source pin is required instead.
    select `PUBLISH_RELEASE=true` for the reviewed main head. The first automatic
    main build installs the parameter with a false default. Ordinary main pushes
    and PR builds run tests, double-build reproducibility and installed-artifact
-   checks without S3 calls or AWS credential binding. Do not configure a trigger
+   checks without S3 calls or AWS credential binding. Any other branch or tag
+   job does the same with a local test version (`0.2.2.4+branch.<name>.<sha>`)
+   and never publishes, even if `PUBLISH_RELEASE=true` is selected; the stable
+   version is built and published only from main. Do not configure a trigger
    to pass true by default. A release retry for an existing key fails closed;
    inspect the original release rather than overwriting it.
    The release build installs its upload client (`boto3`) into a throwaway
