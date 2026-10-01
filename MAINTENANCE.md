@@ -237,6 +237,13 @@ supported where a source pin is required instead.
    checks without S3 calls or AWS credential binding. Do not configure a trigger
    to pass true by default. A release retry for an existing key fails closed;
    inspect the original release rather than overwriting it.
+   The release build installs its upload client (`boto3`) into a throwaway
+   `--target` directory used by that one process, never into the build image's
+   interpreter: the image's AWS CLI v1 pins `botocore` exactly, and upgrading it
+   in place breaks every later `aws` call, including the post-upload readback.
+   After upload the stored object is read back and `scripts/verify-stored-wheel`
+   checks its SHA-256 against the built wheel and that the wheel's own metadata
+   carries the published name and version.
 4. Pin the consumer to the immutable artifact URL and its SHA-256. Where a
    source pin is used instead, pin the immutable 40-character commit SHA, or a
    source archive generated from that same SHA and pinned by SHA-256.

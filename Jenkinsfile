@@ -414,21 +414,31 @@ EOF
                     // the 'ci' image has AWS CLI v1, which cannot express
                     // If-None-Match, so a current boto3 client issues the
                     // conditional put and S3 answers 412 if the key exists.
+                    //
+                    // boto3 is installed into a throwaway --target directory
+                    // and exposed through PYTHONPATH for that one process
+                    // only.  Installing it into the image's interpreter
+                    // upgrades botocore underneath the preinstalled AWS CLI v1,
+                    // which pins botocore exactly and then fails on every
+                    // invocation -- including the readback below.
                     sh(
                         script: """
                             set -eu
-                            python -m pip install --quiet 'boto3>=1.36,<2'
-                            BUCKET='${BUCKET}' KEY='${key}' ARTIFACT='upload/${wheelName}' \
+                            rm -rf /tmp/publish-deps
+                            python -m pip install --quiet --target /tmp/publish-deps 'boto3>=1.36,<2'
+                            PYTHONPATH=/tmp/publish-deps BUCKET='${BUCKET}' KEY='${key}' ARTIFACT='upload/${wheelName}' \
                               python -c 'import os, boto3; artifact = open(os.environ["ARTIFACT"], "rb"); boto3.client("s3").put_object(Bucket=os.environ["BUCKET"], Key=os.environ["KEY"], Body=artifact, IfNoneMatch="*")'
                         """,
                         label: 'Upload wheel (no-overwrite)'
                     )
 
-                    // Read the stored object back and digest THAT, rather than
-                    // trusting the local build.  This is the SHA-256 a
+                    // Read the stored object back and verify THAT, rather than
+                    // trusting the local build: its bytes must hash to the
+                    // built digest, and the wheel's own metadata must carry
+                    // the published name and version.  This is the SHA-256 a
                     // consumer pins.  It verifies the bytes at rest in the
                     // bucket; the index front door is a pass-through over the
-                    // same object.
+                    // same object.  The system AWS CLI is used as shipped.
                     sh(
                         script: """
                             set -eu
@@ -436,12 +446,8 @@ EOF
                               --bucket ${BUCKET} \
                               --key ${key} \
                               stored.whl >/dev/null
+                            python scripts/verify-stored-wheel stored.whl '${wheelName}' '${publishVersion}' '${digest}'
                             STORED="\$(sha256sum stored.whl | cut -d' ' -f1)"
-                            LOCAL='${digest}'
-                            if [ "\$STORED" != "\$LOCAL" ]; then
-                                echo "Stored digest \$STORED does not match built digest \$LOCAL" >&2
-                                exit 1
-                            fi
                             printf '%s  %s\\n' "\$STORED" '${wheelName}' > published.sha256
                             echo "=============================================================="
                             echo " Pin this in Shell:"

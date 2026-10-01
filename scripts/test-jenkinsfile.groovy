@@ -86,7 +86,13 @@ cases.each { scenario ->
         assert upload.contains('IfNoneMatch="*"')
         assert upload.contains('KEY=\'flightsql-dbapi/flightsql_dbapi-0.2.2.4-py3-none-any.whl\'')
         assert !upload.contains('+')
-        assert script.shells.any { it.label == 'Digest the stored artifact' }
+        assert upload.contains('--target /tmp/publish-deps')
+        assert upload.contains('PYTHONPATH=/tmp/publish-deps')
+        // boto3 must never be installed into the interpreter the AWS CLI uses.
+        assert !script.shells.any { it.script =~ /pip install[^\n]*boto3/ && !it.script.contains('--target') }
+        def readback = script.shells.find { it.label == 'Digest the stored artifact' }.script
+        assert readback.contains('aws s3api get-object')
+        assert readback.contains('scripts/verify-stored-wheel stored.whl \'flightsql_dbapi-0.2.2.4-py3-none-any.whl\' \'0.2.2.4\'')
         assert script.archived*.artifacts == ['published.sha256']
     } else if (scenario.failure == 'already published') {
         assert script.credentialStages == ['Reject an already-published version']
