@@ -123,9 +123,12 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   legitimately empty answer from a compliant server (such as a schema with no
   tables) costs one extra GetDbSchemas and never scopes the connection.
   Failures in the advisory fallback probes (including their streams) preserve
-  the successful empty response. In `0.2.2.5`, only transient failures
-  (unavailable, timed out, cancelled) leave discovery undecided so the next empty
-  metadata call retries it. Unimplemented GetCatalogs, denied probes, a missing
+  the successful empty response. In `0.2.2.5`, only transient failures leave
+  discovery undecided so the next empty metadata call retries it: unavailable,
+  timed out and cancelled from any probe, plus INTERNAL and UNKNOWN from
+  GetDbSchemas/GetCatalogs. INTERNAL from the `df_settings` query is not retried,
+  because that is how DataFusion reports a missing information schema.
+  Unimplemented GetCatalogs, denied probes, a missing
   `df_settings` table and malformed probe streams are properties of the server:
   the unscoped outcome is cached for the connection, and later metadata calls
   send only their own RPC instead of repeating GetDbSchemas, GetCatalogs and the
@@ -167,9 +170,11 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   strings as bound values, not raw SQL. SQLAlchemy 2 also rewrites raw tokens
   for qmark, so the guard covers literal and prepared positional paramstyles; choosing
   qmark is not an escape hatch for raw fragments. In `0.2.2.5` the guard applies
-  on SQLAlchemy 2 only: SQLAlchemy 1.4 leaves raw text unchanged for qmark,
-  numeric and format, so on 1.4 such fragments execute as they did before
-  `0.2.2.4`.
+  on SQLAlchemy 2 only: SQLAlchemy 1.4 leaves raw text unchanged for qmark and
+  numeric, so on 1.4 such fragments execute as they did before `0.2.2.4`. With
+  `format` or `pyformat`, SQLAlchemy (1.4 and 2) doubles every `%` in raw text
+  for drivers that %-interpolate; this driver does not, so the doubled text
+  reaches the server. That predates `0.2.2.5`; keep the default qmark.
   The server cannot type a placeholder
   that has no column context (`SELECT $1`); that is a server-side limit.
 - **Errors.** PyArrow/Flight failures are re-raised as PEP 249 exceptions

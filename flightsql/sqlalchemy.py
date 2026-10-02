@@ -424,7 +424,7 @@ class RawSQLFragmentCompiler(compiler.SQLCompiler):
 
     Only SQLAlchemy 2 rewrites the compiled string for positional paramstyles,
     including ``%(name)s`` inside raw text. SQLAlchemy 1.4 leaves raw text
-    untouched for qmark/numeric/format, so the guard does not apply there.
+    untouched for qmark/numeric, so the guard does not apply there.
     """
 
     def _check_raw_fragment(self, text):

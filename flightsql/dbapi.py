@@ -23,6 +23,11 @@ TableMetadataRow = Tuple[str, Optional[str], Any, bool]
 # (unimplemented, denied, missing settings table, malformed stream) is a
 # property of the server and is cached for the connection.
 _TRANSIENT_PROBE_ERRORS = (flight.FlightUnavailableError, flight.FlightTimedOutError, flight.FlightCancelledError)
+# GetDbSchemas and GetCatalogs are plain metadata RPCs, so INTERNAL or UNKNOWN
+# (FlightServerError) from them is a server fault worth retrying. The settings
+# query is different: DataFusion reports a missing information_schema as
+# INTERNAL, which only enabling the information schema changes.
+_TRANSIENT_METADATA_PROBE_ERRORS = _TRANSIENT_PROBE_ERRORS + (flight.FlightInternalError, flight.FlightServerError)
 
 
 @dataclass(frozen=True)
@@ -299,7 +304,8 @@ class Connection:
         server without GetCatalogs, with several catalogs but no readable
         ``information_schema.df_settings``, or that denies a probe keeps the
         unscoped (empty) answer without repeating the probes. Only transient
-        probe failures (unavailable, timed out, cancelled) leave the outcome
+        probe failures (unavailable, timed out, cancelled, and internal or
+        unknown errors from GetDbSchemas/GetCatalogs) leave the outcome
         undecided so the next empty metadata call retries discovery.
         """
         if self.catalog is not None or self._resolved_catalog is not None:
@@ -312,39 +318,47 @@ class Connection:
             except (flight.FlightError, pa.ArrowInvalid) as error:
                 # This is an advisory probe after a successful empty response,
                 # not the original metadata request. Preserve that response.
-                return self._catalog_probe_failed(error)
+                return self._catalog_probe_failed(error, _TRANSIENT_METADATA_PROBE_ERRORS)
             if answers_unscoped:
                 # The server answers unscoped requests; the empty answer stands.
                 self._resolved_catalog = (None,)
                 return False
-        resolved: Optional[str] = None
         try:
             info = self.client.get_catalogs()
             catalogs: List[str] = []
             for table in self._tables_from_info(info):
                 if "catalog_name" in table.column_names:
                     catalogs.extend(name for name in table.column("catalog_name").to_pylist() if name)
-            if len(set(catalogs)) == 1:
-                resolved = catalogs[0]
-            elif catalogs:
-                # A catalog named "datafusion" need not be the SQL default.
-                # Never guess among multiple catalogs: reflection and unqualified
-                # execution must use the same namespace.
-                info = self.client.execute(
-                    "SELECT value FROM information_schema.df_settings WHERE name = 'datafusion.catalog.default_catalog'"
-                )
-                values = [row["value"] for table in self._tables_from_info(info) for row in table.to_pylist()]
-                if len(values) == 1 and isinstance(values[0], str) and values[0] in catalogs:
-                    resolved = values[0]
         except (pa.ArrowNotImplementedError, flight.FlightError, pa.ArrowInvalid) as error:
             # Include DoGet/read failures in the best-effort catalog probe.
-            return self._catalog_probe_failed(error)
+            return self._catalog_probe_failed(error, _TRANSIENT_METADATA_PROBE_ERRORS)
+        resolved: Optional[str] = None
+        if len(set(catalogs)) == 1:
+            resolved = catalogs[0]
+        elif catalogs:
+            # A catalog named "datafusion" need not be the SQL default.
+            # Never guess among multiple catalogs: reflection and unqualified
+            # execution must use the same namespace.
+            try:
+                resolved = self._default_catalog(catalogs)
+            except (pa.ArrowNotImplementedError, flight.FlightError, pa.ArrowInvalid) as error:
+                return self._catalog_probe_failed(error, _TRANSIENT_PROBE_ERRORS)
         self._resolved_catalog = (resolved,)
         return resolved is not None
 
-    def _catalog_probe_failed(self, error: Exception) -> bool:
+    def _default_catalog(self, catalogs: List[str]) -> Optional[str]:
+        """The execution default from DataFusion session settings, if listed."""
+        info = self.client.execute(
+            "SELECT value FROM information_schema.df_settings WHERE name = 'datafusion.catalog.default_catalog'"
+        )
+        values = [row["value"] for table in self._tables_from_info(info) for row in table.to_pylist()]
+        if len(values) == 1 and isinstance(values[0], str) and values[0] in catalogs:
+            return values[0]
+        return None
+
+    def _catalog_probe_failed(self, error: Exception, transient: Tuple[type, ...]) -> bool:
         """Keep the unscoped answer; cache it unless the failure is transient."""
-        if not isinstance(error, _TRANSIENT_PROBE_ERRORS):
+        if not isinstance(error, transient):
             self._resolved_catalog = (None,)
         return False
 

@@ -595,11 +595,13 @@ def _assert_discovery_is_not_repeated(conn, client):
 
 
 TRANSIENT_PROBE_ERRORS = [flight.FlightUnavailableError, flight.FlightTimedOutError, flight.FlightCancelledError]
-PERMANENT_PROBE_ERRORS = [flight.FlightInternalError, flight.FlightUnauthorizedError, pa.ArrowInvalid]
+# INTERNAL and UNKNOWN (FlightServerError) from GetDbSchemas/GetCatalogs are server faults, so they are retried.
+TRANSIENT_METADATA_PROBE_ERRORS = TRANSIENT_PROBE_ERRORS + [flight.FlightInternalError, flight.FlightServerError]
+PERMANENT_METADATA_PROBE_ERRORS = [flight.FlightUnauthorizedError, flight.FlightUnauthenticatedError, pa.ArrowInvalid]
 
 
 @pytest.mark.parametrize("rpc", ["get_db_schemas", "get_catalogs", "catalog_do_get"])
-@pytest.mark.parametrize("error_type", TRANSIENT_PROBE_ERRORS)
+@pytest.mark.parametrize("error_type", TRANSIENT_METADATA_PROBE_ERRORS)
 def test_transient_fallback_probe_failures_preserve_empty_metadata_and_retry(rpc, error_type):
     client = BrokenProbeClient(rpc, error_type)
     conn = Connection(client)
@@ -613,13 +615,35 @@ def test_transient_fallback_probe_failures_preserve_empty_metadata_and_retry(rpc
 
 
 @pytest.mark.parametrize("rpc", ["get_db_schemas", "get_catalogs", "catalog_do_get"])
-@pytest.mark.parametrize("error_type", PERMANENT_PROBE_ERRORS)
+@pytest.mark.parametrize("error_type", PERMANENT_METADATA_PROBE_ERRORS)
 def test_permanent_fallback_probe_failures_are_cached_not_retried(rpc, error_type):
     client = BrokenProbeClient(rpc, error_type)
     conn = Connection(client)
     assert conn.flightsql_get_table_names("public") == []
     assert conn._resolved_catalog == (None,)
     _assert_discovery_is_not_repeated(conn, client)
+
+
+@pytest.mark.parametrize("error_type", [flight.FlightInternalError, flight.FlightServerError])
+def test_one_internal_get_catalogs_failure_does_not_hide_reflection_for_the_connection(error_type):
+    """The information schema is on, so the default resolves once GetCatalogs answers."""
+
+    class FlakyCatalogsClient(CatalogScopedClient):
+        failures = 1
+
+        def get_catalogs(self):
+            if self.failures:
+                self.failures -= 1
+                self.calls.append(("get_catalogs", {}))
+                raise error_type("catalog listing failed")
+            return super().get_catalogs()
+
+    client = FlakyCatalogsClient(catalogs=["datafusion", "cat2"])
+    conn = Connection(client)
+    assert conn.flightsql_get_table_names("public") == []
+    assert conn._resolved_catalog is None
+    assert conn.flightsql_get_table_names("public") == ["orders", "east_orders"]
+    assert conn._metadata_catalog() == "datafusion"
 
 
 def test_server_without_get_catalogs_is_probed_once():
@@ -746,7 +770,13 @@ def test_transient_default_catalog_discovery_failure_stays_unscoped_and_retries(
 @pytest.mark.parametrize("rpc", ["execute", "settings_do_get", "settings_read"])
 @pytest.mark.parametrize(
     "error_type",
-    [pa.ArrowNotImplementedError, flight.FlightInternalError, flight.FlightUnauthorizedError, pa.ArrowInvalid],
+    [
+        pa.ArrowNotImplementedError,
+        flight.FlightInternalError,  # how DataFusion reports a missing information_schema
+        flight.FlightServerError,
+        flight.FlightUnauthorizedError,
+        pa.ArrowInvalid,
+    ],
 )
 def test_denied_or_missing_default_catalog_settings_are_cached(rpc, error_type):
     client = BrokenSettingsClient(rpc, error_type, catalogs=["datafusion", "cat2"])
@@ -808,23 +838,37 @@ def test_literal_pyformat_string_is_safe_as_a_bound_value(literal_binds):
         assert "'%(x)s'" in expanded.statement
 
 
-@pytest.mark.skipif(SQLALCHEMY_2, reason="SQLAlchemy 2 rewrites raw positional text, so the guard applies")
-@pytest.mark.parametrize("fragment", ["text", "literal_column"])
-@pytest.mark.parametrize("compiler_name", ["literal", "prepared"])
-@pytest.mark.parametrize("paramstyle", ["qmark", "numeric", "format"])
-def test_sqlalchemy_14_keeps_raw_pyformat_fragments_unchanged(fragment, compiler_name, paramstyle):
-    if compiler_name == "literal" and paramstyle == "numeric":
-        pytest.skip("SQLAlchemy 1.4 has no post-compile literal support for the numeric paramstyle")
+RAW_PERCENT_FRAGMENT = "'%(x)s %a%'"
+
+
+def _compile_raw_fragment(fragment, compiler_name, paramstyle):
     dialect = DataFusionDialect(paramstyle=paramstyle)
     dialect.statement_compiler = LiteralBindCompiler if compiler_name == "literal" else PreparedStatementCompiler
-    expression = (sqlalchemy.text if fragment == "text" else sqlalchemy.literal_column)("'%(x)s'")
+    expression = (sqlalchemy.text if fragment == "text" else sqlalchemy.literal_column)(RAW_PERCENT_FRAGMENT)
     compiled = select(expression, bindparam("x", 5)).compile(dialect=dialect)
     if compiler_name == "literal":
         statement = compiled._process_parameters_for_postcompile(compiled.construct_params()).statement
         assert statement.endswith(", 5 AS anon_1")
-    else:
-        statement = str(compiled)
-        assert compiled.positiontup == ["x"]
-    # format escapes "%" for the DB API's own %-interpolation; the token survives.
-    expected = "'%%(x)s'" if paramstyle == "format" else "'%(x)s'"
-    assert statement.startswith(f"SELECT {expected}, ")
+        return statement
+    return str(compiled)
+
+
+@pytest.mark.skipif(SQLALCHEMY_2, reason="SQLAlchemy 2 rewrites raw positional text, so the guard applies")
+@pytest.mark.parametrize("fragment", ["text", "literal_column"])
+@pytest.mark.parametrize("compiler_name", ["literal", "prepared"])
+@pytest.mark.parametrize("paramstyle", ["qmark", "numeric"])
+def test_sqlalchemy_14_keeps_raw_pyformat_fragments_unchanged(fragment, compiler_name, paramstyle):
+    if compiler_name == "literal" and paramstyle == "numeric":
+        pytest.skip("SQLAlchemy 1.4 has no post-compile literal support for the numeric paramstyle")
+    assert _compile_raw_fragment(fragment, compiler_name, paramstyle).startswith(f"SELECT {RAW_PERCENT_FRAGMENT}, ")
+
+
+@pytest.mark.skipif(SQLALCHEMY_2, reason="covers the SQLAlchemy 1.4 compiler")
+@pytest.mark.parametrize("fragment", ["text", "literal_column"])
+@pytest.mark.parametrize("compiler_name", ["literal", "prepared"])
+@pytest.mark.parametrize("paramstyle", ["format", "pyformat"])
+def test_sqlalchemy_14_format_paramstyles_double_every_percent_in_raw_text(fragment, compiler_name, paramstyle):
+    # SQLAlchemy escapes "%" for drivers that %-interpolate; this driver does
+    # not, so the doubled text reaches the server. Use qmark (the default).
+    doubled = RAW_PERCENT_FRAGMENT.replace("%", "%%")
+    assert _compile_raw_fragment(fragment, compiler_name, paramstyle).startswith(f"SELECT {doubled}, ")

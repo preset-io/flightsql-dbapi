@@ -279,6 +279,7 @@ On SQLAlchemy 2, in both literal and prepared mode with positional placeholders,
 raw `text()` or `literal_column()` fragments containing `%(name)s` are rejected
 with `CompileError`: SQLAlchemy 2 would otherwise rewrite that text or raise
 `KeyError`. Pass these strings as bound values instead. SQLAlchemy 1.4 does not
-rewrite raw text for positional paramstyles, so there such fragments execute
-unchanged. See the
+rewrite raw text for the qmark (default) or numeric paramstyles, so there such
+fragments execute unchanged. With `format` or `pyformat`, SQLAlchemy doubles
+every `%` in raw text, and this driver sends the doubled text as is. See the
 [compatibility notes](MAINTENANCE.md#datafusion-flight-sql-service-compatibility).
