@@ -18,6 +18,12 @@ apilevel = "2.0"
 ExecuteParams = Union[Tuple[Any, ...], List[Any]]
 TableMetadataRow = Tuple[str, Optional[str], Any, bool]
 
+# Catalog discovery failures that say nothing lasting about the server. Only
+# these are retried on the next empty metadata call; any other probe failure
+# (unimplemented, denied, missing settings table, malformed stream) is a
+# property of the server and is cached for the connection.
+_TRANSIENT_PROBE_ERRORS = (flight.FlightUnavailableError, flight.FlightTimedOutError, flight.FlightCancelledError)
+
 
 @dataclass(frozen=True)
 class TableMetadataResult:
@@ -285,10 +291,16 @@ class Connection:
         is not evidence of that, so the decision rests on the unfiltered,
         unscoped GetDbSchemas: only when it is empty is one catalog resolved
         from GetCatalogs -- the only catalog, or the execution default reported
-        by DataFusion session settings when several catalogs exist. Successful
-        discovery is cached per connection; failed advisory probes are retried; the return value says whether the caller
-        should retry scoped to the resolved catalog. A server without
-        GetCatalogs keeps the unscoped (empty) answer.
+        by DataFusion session settings when several catalogs exist. The return
+        value says whether the caller should retry scoped to the resolved
+        catalog.
+
+        The outcome is cached per connection, including an unresolved one: a
+        server without GetCatalogs, with several catalogs but no readable
+        ``information_schema.df_settings``, or that denies a probe keeps the
+        unscoped (empty) answer without repeating the probes. Only transient
+        probe failures (unavailable, timed out, cancelled) leave the outcome
+        undecided so the next empty metadata call retries discovery.
         """
         if self.catalog is not None or self._resolved_catalog is not None:
             return False
@@ -297,10 +309,10 @@ class Connection:
                 answers_unscoped = bool(self._schema_names(None))
             except pa.ArrowNotImplementedError:
                 answers_unscoped = False  # no GetDbSchemas: cannot tell, try GetCatalogs
-            except (flight.FlightError, pa.ArrowInvalid):
+            except (flight.FlightError, pa.ArrowInvalid) as error:
                 # This is an advisory probe after a successful empty response,
                 # not the original metadata request. Preserve that response.
-                return False
+                return self._catalog_probe_failed(error)
             if answers_unscoped:
                 # The server answers unscoped requests; the empty answer stands.
                 self._resolved_catalog = (None,)
@@ -324,11 +336,17 @@ class Connection:
                 values = [row["value"] for table in self._tables_from_info(info) for row in table.to_pylist()]
                 if len(values) == 1 and isinstance(values[0], str) and values[0] in catalogs:
                     resolved = values[0]
-        except (pa.ArrowNotImplementedError, flight.FlightError, pa.ArrowInvalid):
+        except (pa.ArrowNotImplementedError, flight.FlightError, pa.ArrowInvalid) as error:
             # Include DoGet/read failures in the best-effort catalog probe.
-            return False
+            return self._catalog_probe_failed(error)
         self._resolved_catalog = (resolved,)
         return resolved is not None
+
+    def _catalog_probe_failed(self, error: Exception) -> bool:
+        """Keep the unscoped answer; cache it unless the failure is transient."""
+        if not isinstance(error, _TRANSIENT_PROBE_ERRORS):
+            self._resolved_catalog = (None,)
+        return False
 
     @check_closed
     @translate_errors

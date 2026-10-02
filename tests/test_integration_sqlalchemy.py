@@ -12,7 +12,10 @@ from sqlalchemy import (
     bindparam,
     create_engine,
     event,
+    exc,
+    literal_column,
     select,
+    text,
     tuple_,
 )
 from sqlalchemy.engine import URL
@@ -22,7 +25,11 @@ from sqlalchemy.sql import compiler
 from sqlalchemy.sql.sqltypes import NullType
 
 import flightsql.flightsql_pb2 as flightsql
-from flightsql.sqlalchemy import FEATURE_PREPARED_STATEMENTS, LiteralBindCompiler
+from flightsql.sqlalchemy import (
+    _SQLALCHEMY_2,
+    FEATURE_PREPARED_STATEMENTS,
+    LiteralBindCompiler,
+)
 
 from . import integration
 from .sqlalchemy_compat import with_bind_values
@@ -341,5 +348,34 @@ def test_integration_prepared_decimal_bind(type_):
         with engine.connect() as connection:
             rows = connection.execute(select(table.c.id).where(table.c.value > Decimal("0.5"))).all()
         assert rows == [(1,)]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.skipif(integration.is_disabled(), reason=integration.disabled_message)
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("fragment", ["text", "literal_column"])
+def test_integration_raw_pyformat_fragment_by_sqlalchemy_version(prepared, fragment):
+    """SQLAlchemy 1.4 sends raw ``%(name)s`` text unchanged; 2.x would rewrite it, so it is rejected."""
+    engine = new_sqlalchemy_engine(features={FEATURE_PREPARED_STATEMENTS: "on"} if prepared else None)
+    # The raw literal must equal itself spelled without the token, so a rewrite
+    # (e.g. to '?') would return no rows. Selecting a table column keeps every
+    # result column typed for the reference server.
+    if fragment == "text":
+        statement = text("SELECT id FROM intTable WHERE '%(x)s' = '%' || '(x)s' AND id = :n").bindparams(n=1)
+    else:
+        table = Table("intTable", MetaData(), Column("id", Integer))
+        statement = (
+            select(table.c.id)
+            .where(literal_column("'%(x)s'") == literal_column("'%' || '(x)s'"))
+            .where(table.c.id == bindparam("n", 1))
+        )
+    try:
+        with engine.connect() as connection:
+            if _SQLALCHEMY_2:
+                with pytest.raises(exc.CompileError, match="raw.*bind parameter"):
+                    connection.execute(statement)
+            else:
+                assert connection.execute(statement).all() == [(1,)]
     finally:
         engine.dispose()

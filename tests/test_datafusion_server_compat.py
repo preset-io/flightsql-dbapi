@@ -26,7 +26,11 @@ from flightsql.dbapi import (
     TableMetadataResult,
     build_parameter_record,
 )
-from flightsql.sqlalchemy import DataFusionDialect, LiteralBindCompiler
+from flightsql.sqlalchemy import (
+    DataFusionDialect,
+    LiteralBindCompiler,
+    PreparedStatementCompiler,
+)
 
 SQLALCHEMY_2 = int(sqlalchemy.__version__.split(".")[0]) >= 2
 
@@ -549,27 +553,55 @@ def test_prepared_raw_pyformat_fragments_fail_clearly_without_rewriting(fragment
     engine.dispose()
 
 
+class BrokenProbeClient(CatalogScopedClient):
+    """Fails one advisory discovery RPC (or its stream) while ``fail`` is set."""
+
+    fail = True
+
+    def __init__(self, rpc, error_type, **kwargs):
+        super().__init__(**kwargs)
+        self.rpc = rpc
+        self.error_type = error_type
+
+    def get_db_schemas(self, **kwargs):
+        if self.fail and self.rpc == "get_db_schemas" and "catalog" not in kwargs:
+            self.calls.append(("get_db_schemas", kwargs))
+            raise self.error_type("probe failed")
+        return super().get_db_schemas(**kwargs)
+
+    def get_catalogs(self):
+        if self.fail and self.rpc == "get_catalogs":
+            self.calls.append(("get_catalogs", {}))
+            raise self.error_type("probe failed")
+        return super().get_catalogs()
+
+    def do_get(self, ticket):
+        if self.fail and ticket[0] == "catalogs" and self.rpc == "catalog_do_get":
+            raise self.error_type("probe stream failed")
+        return super().do_get(ticket)
+
+
+UNSCOPED_METADATA_CALLS = [("get_tables", {"db_schema_filter_pattern": "public"}), ("get_db_schemas", {})]
+
+
+def _assert_discovery_is_not_repeated(conn, client):
+    """Later empty answers stand with only their own RPC, even once probes would work."""
+    client.fail = False
+    del client.calls[:]
+    for _ in range(3):
+        assert conn.flightsql_get_table_names("public") == []
+        assert conn.flightsql_get_schema_names() == []
+    assert client.calls == UNSCOPED_METADATA_CALLS * 3
+
+
+TRANSIENT_PROBE_ERRORS = [flight.FlightUnavailableError, flight.FlightTimedOutError, flight.FlightCancelledError]
+PERMANENT_PROBE_ERRORS = [flight.FlightInternalError, flight.FlightUnauthorizedError, pa.ArrowInvalid]
+
+
 @pytest.mark.parametrize("rpc", ["get_db_schemas", "get_catalogs", "catalog_do_get"])
-@pytest.mark.parametrize("error_type", [flight.FlightInternalError, pa.ArrowInvalid, flight.FlightUnavailableError])
-def test_failed_fallback_probes_preserve_successful_empty_metadata(rpc, error_type):
-    class BrokenProbeClient(CatalogScopedClient):
-        def get_db_schemas(self, **kwargs):
-            if self.fail and rpc == "get_db_schemas":
-                raise error_type("probe failed")
-            return super().get_db_schemas(**kwargs)
-
-        def get_catalogs(self):
-            if self.fail and rpc == "get_catalogs":
-                raise error_type("probe failed")
-            return super().get_catalogs()
-
-        def do_get(self, ticket):
-            if self.fail and ticket[0] == "catalogs" and rpc == "catalog_do_get":
-                raise error_type("probe stream failed")
-            return super().do_get(ticket)
-
-    client = BrokenProbeClient()
-    client.fail = True
+@pytest.mark.parametrize("error_type", TRANSIENT_PROBE_ERRORS)
+def test_transient_fallback_probe_failures_preserve_empty_metadata_and_retry(rpc, error_type):
+    client = BrokenProbeClient(rpc, error_type)
     conn = Connection(client)
     assert conn.flightsql_get_table_names("missing") == []
     assert conn._metadata_catalog() is None
@@ -578,6 +610,25 @@ def test_failed_fallback_probes_preserve_successful_empty_metadata(rpc, error_ty
     client.fail = False
     assert conn.flightsql_get_table_names("public") == ["orders", "east_orders"]
     assert conn.flightsql_get_schema_names() == ["information_schema", "public"]
+
+
+@pytest.mark.parametrize("rpc", ["get_db_schemas", "get_catalogs", "catalog_do_get"])
+@pytest.mark.parametrize("error_type", PERMANENT_PROBE_ERRORS)
+def test_permanent_fallback_probe_failures_are_cached_not_retried(rpc, error_type):
+    client = BrokenProbeClient(rpc, error_type)
+    conn = Connection(client)
+    assert conn.flightsql_get_table_names("public") == []
+    assert conn._resolved_catalog == (None,)
+    _assert_discovery_is_not_repeated(conn, client)
+
+
+def test_server_without_get_catalogs_is_probed_once():
+    client = CatalogScopedClient(get_catalogs_implemented=False)
+    conn = Connection(client)
+    assert conn.flightsql_get_schema_names() == []
+    assert [name for name, _ in client.calls] == ["get_db_schemas", "get_catalogs"]
+    assert conn._resolved_catalog == (None,)
+    _assert_discovery_is_not_repeated(conn, client)
 
 
 def test_primary_metadata_error_is_not_swallowed_as_a_fallback_failure():
@@ -605,6 +656,7 @@ def test_prepared_pyformat_string_is_safe_as_a_bound_value():
     engine.dispose()
 
 
+@pytest.mark.skipif(not SQLALCHEMY_2, reason="SQLAlchemy 1.4 does not rewrite raw qmark text")
 def test_raw_pyformat_fragment_also_rejects_qmark_rewriting():
     engine = sqlalchemy.create_engine(
         URL.create(
@@ -651,30 +703,39 @@ def test_multiple_catalogs_without_verified_default_never_guess_datafusion(defau
     assert conn._metadata_catalog() is None
 
 
+class BrokenSettingsClient(CatalogScopedClient):
+    """Fails the DataFusion settings query (or its stream) while ``fail`` is set."""
+
+    fail = True
+
+    def __init__(self, rpc, error_type, **kwargs):
+        super().__init__(**kwargs)
+        self.rpc = rpc
+        self.error_type = error_type
+
+    def execute(self, query):
+        if self.fail and self.rpc == "execute":
+            self.calls.append(("execute", {"query": query}))
+            raise self.error_type("settings unavailable")
+        return super().execute(query)
+
+    def do_get(self, ticket):
+        if self.fail and ticket[0] == "settings":
+            if self.rpc == "settings_do_get":
+                raise self.error_type("settings stream unavailable")
+            if self.rpc == "settings_read":
+
+                def read_all():
+                    raise self.error_type("settings read failed")
+
+                return SimpleNamespace(read_all=read_all)
+        return super().do_get(ticket)
+
+
 @pytest.mark.parametrize("rpc", ["execute", "settings_do_get", "settings_read"])
-@pytest.mark.parametrize("error_type", [pa.ArrowNotImplementedError, pa.ArrowInvalid, flight.FlightUnavailableError])
-def test_failed_default_catalog_discovery_stays_unscoped_and_retries(rpc, error_type):
-    class BrokenSettingsClient(CatalogScopedClient):
-        fail = True
-
-        def execute(self, query):
-            if self.fail and rpc == "execute":
-                raise error_type("settings unavailable")
-            return super().execute(query)
-
-        def do_get(self, ticket):
-            if self.fail and ticket[0] == "settings":
-                if rpc == "settings_do_get":
-                    raise error_type("settings stream unavailable")
-                if rpc == "settings_read":
-
-                    def read_all():
-                        raise error_type("settings read failed")
-
-                    return SimpleNamespace(read_all=read_all)
-            return super().do_get(ticket)
-
-    client = BrokenSettingsClient(catalogs=["datafusion", "cat2"])
+@pytest.mark.parametrize("error_type", TRANSIENT_PROBE_ERRORS)
+def test_transient_default_catalog_discovery_failure_stays_unscoped_and_retries(rpc, error_type):
+    client = BrokenSettingsClient(rpc, error_type, catalogs=["datafusion", "cat2"])
     conn = Connection(client)
     assert conn.flightsql_get_table_names("public") == []
     assert conn._resolved_catalog is None
@@ -682,6 +743,48 @@ def test_failed_default_catalog_discovery_stays_unscoped_and_retries(rpc, error_
     assert conn.flightsql_get_table_names("public") == ["orders", "east_orders"]
 
 
+@pytest.mark.parametrize("rpc", ["execute", "settings_do_get", "settings_read"])
+@pytest.mark.parametrize(
+    "error_type",
+    [pa.ArrowNotImplementedError, flight.FlightInternalError, flight.FlightUnauthorizedError, pa.ArrowInvalid],
+)
+def test_denied_or_missing_default_catalog_settings_are_cached(rpc, error_type):
+    client = BrokenSettingsClient(rpc, error_type, catalogs=["datafusion", "cat2"])
+    conn = Connection(client)
+    assert conn.flightsql_get_table_names("public") == []
+    assert conn._resolved_catalog == (None,)
+    assert [name for name, _ in client.calls].count("execute") == 1
+    _assert_discovery_is_not_repeated(conn, client)
+
+
+def test_multi_catalog_server_without_information_schema_caches_unresolved_discovery():
+    """DataFusion's default config has no information_schema, so df_settings is missing.
+
+    Reflection stays unscoped (empty, since the server only answers a named
+    catalog) rather than guessing among catalogs, and that outcome is decided
+    once: later metadata calls send only their own RPC.
+    """
+
+    class NoInformationSchemaClient(CatalogScopedClient):
+        def execute(self, query):
+            self.calls.append(("execute", {"query": query}))
+            if "information_schema" in query:
+                # Raised at GetFlightInfo by the planner, as observed live.
+                raise flight.FlightInternalError("table 'information_schema.df_settings' not found")
+            return super().execute(query)
+
+    client = NoInformationSchemaClient(catalogs=["datafusion", "cat2"])
+    conn = Connection(client)
+    assert conn.flightsql_get_schema_names() == []
+    assert [name for name, _ in client.calls] == ["get_db_schemas", "get_catalogs", "execute"]
+    assert conn._resolved_catalog == (None,)
+    _assert_discovery_is_not_repeated(conn, client)
+    # An explicit catalog still scopes metadata on such a server.
+    scoped = Connection(NoInformationSchemaClient(catalogs=["datafusion", "cat2"]), catalog="datafusion")
+    assert scoped.flightsql_get_schema_names() == ["information_schema", "public"]
+
+
+@pytest.mark.skipif(not SQLALCHEMY_2, reason="SQLAlchemy 1.4 does not rewrite raw positional text")
 @pytest.mark.parametrize("fragment", ["text", "literal_column"])
 @pytest.mark.parametrize("literal_binds", [False, True])
 @pytest.mark.parametrize("paramstyle", ["qmark", "numeric"])
@@ -703,3 +806,25 @@ def test_literal_pyformat_string_is_safe_as_a_bound_value(literal_binds):
     else:
         expanded = compiled._process_parameters_for_postcompile(compiled.construct_params())
         assert "'%(x)s'" in expanded.statement
+
+
+@pytest.mark.skipif(SQLALCHEMY_2, reason="SQLAlchemy 2 rewrites raw positional text, so the guard applies")
+@pytest.mark.parametrize("fragment", ["text", "literal_column"])
+@pytest.mark.parametrize("compiler_name", ["literal", "prepared"])
+@pytest.mark.parametrize("paramstyle", ["qmark", "numeric", "format"])
+def test_sqlalchemy_14_keeps_raw_pyformat_fragments_unchanged(fragment, compiler_name, paramstyle):
+    if compiler_name == "literal" and paramstyle == "numeric":
+        pytest.skip("SQLAlchemy 1.4 has no post-compile literal support for the numeric paramstyle")
+    dialect = DataFusionDialect(paramstyle=paramstyle)
+    dialect.statement_compiler = LiteralBindCompiler if compiler_name == "literal" else PreparedStatementCompiler
+    expression = (sqlalchemy.text if fragment == "text" else sqlalchemy.literal_column)("'%(x)s'")
+    compiled = select(expression, bindparam("x", 5)).compile(dialect=dialect)
+    if compiler_name == "literal":
+        statement = compiled._process_parameters_for_postcompile(compiled.construct_params()).statement
+        assert statement.endswith(", 5 AS anon_1")
+    else:
+        statement = str(compiled)
+        assert compiled.positiontup == ["x"]
+    # format escapes "%" for the DB API's own %-interpolation; the token survives.
+    expected = "'%%(x)s'" if paramstyle == "format" else "'%(x)s'"
+    assert statement.startswith(f"SELECT {expected}, ")

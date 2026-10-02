@@ -420,10 +420,15 @@ class FlightSQLDialect(default.DefaultDialect):
 
 
 class RawSQLFragmentCompiler(compiler.SQLCompiler):
-    """Reject raw pyformat tokens before SQLAlchemy's positional rewrite sees them."""
+    """Reject raw pyformat tokens before SQLAlchemy's positional rewrite sees them.
+
+    Only SQLAlchemy 2 rewrites the compiled string for positional paramstyles,
+    including ``%(name)s`` inside raw text. SQLAlchemy 1.4 leaves raw text
+    untouched for qmark/numeric/format, so the guard does not apply there.
+    """
 
     def _check_raw_fragment(self, text):
-        if self.dialect.positional and re.search(r"%\([^)]+\)s", text):
+        if _SQLALCHEMY_2 and self.dialect.positional and re.search(r"%\([^)]+\)s", text):
             raise exc.CompileError(
                 "raw SQL containing %(name)s is unsafe with positional parameters; "
                 "pass the string as a bind parameter instead"
