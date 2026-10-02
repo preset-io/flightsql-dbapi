@@ -14,6 +14,7 @@ import email.parser
 import hashlib
 import sys
 import zipfile
+import zlib
 from pathlib import Path
 
 
@@ -46,7 +47,8 @@ def main(argv):
                     errors.append(f"wheel metadata Name {headers['Name']!r} does not match {name!r}")
                 if headers["Version"] != version:
                     errors.append(f"wheel metadata Version {headers['Version']!r} != {version!r}")
-    except (OSError, zipfile.BadZipFile) as error:
+    except (OSError, zipfile.BadZipFile, zlib.error, EOFError, UnicodeDecodeError) as error:
+        # Corrupt compressed data or non-UTF-8 METADATA is a bad artifact, not a crash.
         errors.append(f"stored object is not a readable wheel: {error}")
 
     for error in errors:
