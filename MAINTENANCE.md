@@ -122,10 +122,21 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   a catalog named `datafusion` is never assumed to be the execution default. A
   legitimately empty answer from a compliant server (such as a schema with no
   tables) costs one extra GetDbSchemas and never scopes the connection.
-  Flight/INVALID_ARGUMENT failures in the advisory fallback probes (including
-  their streams) preserve the successful empty response and leave the connection
-  unscoped without caching the failure, so the next call retries discovery.
-  Failures of the original metadata request still propagate.
+  Failures in the advisory fallback probes (including their streams) preserve
+  the successful empty response. In `0.2.2.5`, only transient failures leave
+  discovery undecided so the next empty metadata call retries it: unavailable,
+  timed out and cancelled from any probe, plus INTERNAL and UNKNOWN from
+  GetDbSchemas/GetCatalogs. INTERNAL from the `df_settings` query is not retried,
+  because that is how DataFusion reports a missing information schema.
+  Unimplemented GetCatalogs, denied probes, a missing
+  `df_settings` table and malformed probe streams are properties of the server:
+  the unscoped outcome is cached for the connection, and later metadata calls
+  send only their own RPC instead of repeating GetDbSchemas, GetCatalogs and the
+  settings query. Consequently a multi-catalog DataFusion server with the
+  information schema off (DataFusion's default) has no reflection: no-path
+  reflection returns empty lists, and a URL path fails closed as above. Enable
+  the information schema on such servers. Failures of the original metadata
+  request still propagate.
 - **Views are reported with `table_type = VIEW`.** `get_table_names()` excludes
   them, `get_view_names()` lists them, and `has_table()` covers both.
 - **Strings arrive as Utf8View.** Arrow string, binary and list view types map
@@ -153,12 +164,17 @@ client now handles, each covered by `tests/test_datafusion_server_compat.py`:
   The default literal path keeps qmark: SQLAlchemy's numeric paramstyles
   rescan the post-compiled statement for `%(name)s`, which would corrupt
   literal values containing that text. **Raw-fragment limitation:** this
-  upstream numeric rewrite also scans raw `text()` and `literal_column()` SQL.
+  SQLAlchemy 2 numeric rewrite also scans raw `text()` and `literal_column()` SQL.
   In `0.2.2.4` those fragments containing `%(name)s` raise a clear `CompileError`
   rather than a `KeyError` or silently changing a literal into `$n`. Pass such
   strings as bound values, not raw SQL. SQLAlchemy 2 also rewrites raw tokens
   for qmark, so the guard covers literal and prepared positional paramstyles; choosing
-  qmark is not an escape hatch for raw fragments.
+  qmark is not an escape hatch for raw fragments. In `0.2.2.5` the guard applies
+  on SQLAlchemy 2 only: SQLAlchemy 1.4 leaves raw text unchanged for qmark and
+  numeric, so on 1.4 such fragments execute as they did before `0.2.2.4`. With
+  `format` or `pyformat`, SQLAlchemy (1.4 and 2) doubles every `%` in raw text
+  for drivers that %-interpolate; this driver does not, so the doubled text
+  reaches the server. That predates `0.2.2.5`; keep the default qmark.
   The server cannot type a placeholder
   that has no column context (`SELECT $1`); that is a server-side limit.
 - **Errors.** PyArrow/Flight failures are re-raised as PEP 249 exceptions
@@ -224,9 +240,9 @@ artifact URL together with its SHA-256. A PEP 508 direct reference to
 supported where a source pin is required instead.
 
 1. Record the internal fork version in `pyproject.toml` and
-   `flightsql/__init__.py` (currently `0.2.2.4`). Published artifacts are
+   `flightsql/__init__.py` (currently `0.2.2.5`). Published artifacts are
    immutable and are never rebuilt in place, so any subsequent change ships as
-   a new fourth component (`0.2.2.5`, and so on). The pipeline refuses to
+   a new fourth component (`0.2.2.6`, and so on). The pipeline refuses to
    overwrite an existing key rather than relying on this being remembered.
 2. Run the installed-wheel matrix and the reference-server suite, and merge the
    reviewed, green version change.
@@ -235,7 +251,7 @@ supported where a source pin is required instead.
    main build installs the parameter with a false default. Ordinary main pushes
    and PR builds run tests, double-build reproducibility and installed-artifact
    checks without S3 calls or AWS credential binding. Any other branch or tag
-   job does the same with a local test version (`0.2.2.4+branch.<name>.<sha>`)
+   job does the same with a local test version (`0.2.2.5+branch.<name>.<sha>`)
    and never publishes, even if `PUBLISH_RELEASE=true` is selected; the stable
    version is built and published only from main. Do not configure a trigger
    to pass true by default. A release retry for an existing key fails closed;
