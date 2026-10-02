@@ -58,12 +58,26 @@ def cases = [
     [branch: 'PR-7', release: false],
     [branch: 'PR-7', release: true], // A PR cannot opt into publication.
     [branch: 'main', changeId: '7', release: true], // CHANGE_ID also excludes main.
-    [branch: 'feature/nope', release: true, failure: 'Refusing to build stable version'],
-    [branch: 'v0.2.2.5', release: true, failure: 'Refusing to build stable version'],
+    // Any other ref builds and verifies a local version and never publishes,
+    // even when a release is requested: stable publication is main-only.
+    [branch: 'release-readback-awscli', version: '0.2.2.5+branch.release.readback.awscli.abc1234'],
+    [branch: 'release-readback-awscli', release: false, version: '0.2.2.5+branch.release.readback.awscli.abc1234'],
+    [branch: 'feature/nope', release: true, version: '0.2.2.5+branch.feature.nope.abc1234'],
+    [branch: 'v0.2.2.5', release: true, version: '0.2.2.5+branch.v0.2.2.5.abc1234'],
+    [branch: 'Fix/007__Hot-0', version: '0.2.2.5+branch.fix.7.hot.0.abc1234'],
+    // Mutation: if main-only gating were ever lost, the publish step still
+    // refuses a non-stable version.
+    [branch: 'feature/nope', release: true, exists: false, mutate: true, failure: 'Refusing to publish'],
 ]
 int checkedShells = 0
 cases.each { scenario ->
-    def script = new GroovyShell(this.class.classLoader, new Binding(), config).parse(pipeline)
+    String text = pipeline.text
+    if (scenario.mutate) {
+        String gate = 'boolean publishes = isMain && params.PUBLISH_RELEASE == true'
+        assert text.contains(gate)
+        text = text.replace(gate, 'boolean publishes = params.PUBLISH_RELEASE == true')
+    }
+    def script = new GroovyShell(this.class.classLoader, new Binding(), config).parse(text)
     script.setScenario(scenario)
     String failure = null
     try {
@@ -86,11 +100,21 @@ cases.each { scenario ->
         assert upload.contains('IfNoneMatch="*"')
         assert upload.contains('KEY=\'flightsql-dbapi/flightsql_dbapi-0.2.2.5-py3-none-any.whl\'')
         assert !upload.contains('+')
-        assert script.shells.any { it.label == 'Digest the stored artifact' }
+        assert upload.contains('--target /tmp/publish-deps')
+        assert upload.contains('PYTHONPATH=/tmp/publish-deps')
+        // boto3 must never be installed into the interpreter the AWS CLI uses.
+        assert !script.shells.any { it.script =~ /pip install[^\n]*boto3/ && !it.script.contains('--target') }
+        def readback = script.shells.find { it.label == 'Digest the stored artifact' }.script
+        assert readback.contains('aws s3api get-object')
+        assert readback.contains('scripts/verify-stored-wheel stored.whl \'flightsql_dbapi-0.2.2.5-py3-none-any.whl\' \'0.2.2.5\'')
         assert script.archived*.artifacts == ['published.sha256']
     } else if (scenario.failure == 'already published') {
         assert script.credentialStages == ['Reject an already-published version']
         assert !script.shells.any { it.label == 'Upload wheel (no-overwrite)' }
+    } else if (scenario.mutate) {
+        assert !script.credentialStages.contains('Publish wheel')
+        assert !script.shells.any { it.label == 'Upload wheel (no-overwrite)' || it.script.contains('put_object(') }
+        assert script.archived.empty
     } else {
         assert script.credentialStages.empty: scenario
         assert !script.shells.any { it.script.contains('aws s3api') || it.script.contains('put_object(') }
@@ -99,6 +123,18 @@ cases.each { scenario ->
     if (scenario.branch.startsWith('PR-') || scenario.changeId) {
         def install = script.shells.find { it.label == 'Install and inspect artifact' }.script
         assert install.contains('0.2.2.5+')
+    }
+    if (scenario.version) {
+        def install = script.shells.find { it.label == 'Install and inspect artifact' }.script
+        assert install.contains("assert dist.version == \"${scenario.version}\"")
+        assert install.contains("upload/flightsql_dbapi-${scenario.version}-py3-none-any.whl")
+        def apply = script.shells.find { it.label == 'Apply local test version' }.script
+        assert apply.contains("version = \"${scenario.version}\"")
+    }
+    if (scenario.branch == 'main' && !scenario.changeId && !scenario.failure) {
+        def install = script.shells.find { it.label == 'Install and inspect artifact' }.script
+        assert install.contains('assert dist.version == "0.2.2.5"')
+        assert !script.shells.any { it.label == 'Apply local test version' }
     }
     script.shells.each { step ->
         def process = new ProcessBuilder('bash', '-n').start()

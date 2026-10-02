@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Check a wheel read back from storage against the wheel that was built.
+
+Usage: verify-stored-wheel STORED_FILE WHEEL_FILENAME VERSION SHA256
+
+Verifies, using only the standard library so it runs on any interpreter:
+  * the SHA-256 of the stored bytes equals the built digest;
+  * the wheel's own METADATA names the expected distribution and version;
+  * those agree with the filename the artifact was published under.
+Exits non-zero, printing the mismatch to stderr, on any disagreement.
+"""
+
+import email.parser
+import hashlib
+import sys
+import zipfile
+from pathlib import Path
+
+
+def main(argv):
+    if len(argv) != 5:
+        print(__doc__, file=sys.stderr)
+        return 2
+    stored, filename, version, expected_digest = argv[1:]
+    errors = []
+
+    digest = hashlib.sha256(Path(stored).read_bytes()).hexdigest()
+    if digest != expected_digest:
+        errors.append(f"stored sha256 {digest} does not match built sha256 {expected_digest}")
+
+    name = filename.split("-", 1)[0]
+    if not filename.endswith(".whl") or filename.split("-")[1:2] != [version]:
+        errors.append(f"filename {filename!r} does not carry version {version!r}")
+
+    try:
+        with zipfile.ZipFile(stored) as wheel:
+            metadata_files = [n for n in wheel.namelist() if n.endswith(".dist-info/METADATA")]
+            if len(metadata_files) != 1:
+                errors.append(f"expected one METADATA file in the wheel, found {metadata_files}")
+            else:
+                headers = email.parser.Parser().parsestr(
+                    wheel.read(metadata_files[0]).decode("utf-8"), headersonly=True
+                )
+                normalized = headers["Name"].replace("-", "_").lower() if headers["Name"] else None
+                if normalized != name.lower():
+                    errors.append(f"wheel metadata Name {headers['Name']!r} does not match {name!r}")
+                if headers["Version"] != version:
+                    errors.append(f"wheel metadata Version {headers['Version']!r} != {version!r}")
+    except (OSError, zipfile.BadZipFile) as error:
+        errors.append(f"stored object is not a readable wheel: {error}")
+
+    for error in errors:
+        print(f"verify-stored-wheel: {error}", file=sys.stderr)
+    if errors:
+        return 1
+    print(f"verify-stored-wheel: {filename} version {version} sha256 {digest} verified")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

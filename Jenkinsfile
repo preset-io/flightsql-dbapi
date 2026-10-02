@@ -57,6 +57,12 @@
 //                    No S3 access, credential binding or index publication.
 //                    Local versions match ==0.2.2.5 and sort above it, so
 //                    immutable PR URLs in the shared index are NOT safe here.
+//   * other refs  -> 0.2.2.5+branch.<name>.<shortsha>: any non-main branch
+//                    (or tag) job, e.g. the branch job a multibranch project
+//                    creates alongside an origin PR.  Treated exactly like a
+//                    PR: build, test and verify, never publish.  The stable
+//                    version is never built off main, so it cannot be
+//                    published from any other ref.
 //
 // A four-component version is used rather than a PEP 440 local version such as
 // 0.2.3+preset.2 because a local version is MATCHED by the corresponding
@@ -173,11 +179,27 @@ podTemplate(
                     // assertion fails if backend normalisation changes.
                     String localSegment = "${env.BRANCH_NAME}.${shortGitRev}".toLowerCase().replaceAll(/[-_]/, '.')
                     publishVersion = "${baseVersion}+${localSegment}"
+                } else if (!isMain) {
+                    // Any other ref builds and verifies as a local test
+                    // version instead of failing, so an ordinary branch push
+                    // gets a real build signal.  Branch names may contain
+                    // characters PEP 440 rejects ('/', '@', ...), so every
+                    // run of them becomes '.'.  Numeric components are
+                    // written without leading zeros, as the backend
+                    // normalises them, so the predicted filename stays exact.
+                    // The 'branch' prefix keeps it distinct from a PR build.
+                    String localSegment = "branch.${env.BRANCH_NAME}.${shortGitRev}".toLowerCase()
+                            .replaceAll(/[^a-z0-9]+/, '.')
+                            .replaceAll(/^\.|\.$/, '')
+                            .replaceAll(/(^|\.)0+(?=[0-9]+(\.|$))/, '$1')
+                    publishVersion = "${baseVersion}+${localSegment}"
                 } else {
                     publishVersion = baseVersion
                 }
 
                 // A stable release may only come from reviewed, merged history.
+                // Unreachable by construction above; kept as a fail-closed
+                // invariant so a future edit cannot build stable off main.
                 if (!isMain && publishVersion == baseVersion) {
                     error("Refusing to build stable version ${baseVersion} from branch " +
                           "'${env.BRANCH_NAME}'. Stable releases are published only from main.")
@@ -252,7 +274,7 @@ podTemplate(
 
         container('py-ci') {
             stage('Build and verify reproducibility') {
-                if (isPullRequest) {
+                if (!isMain) {
                     // Both files are rewritten together: scripts/lint-version
                     // ties them, and the artifact identity depends on both.
                     sh(
@@ -402,6 +424,12 @@ EOF
                     echo 'No explicit main release requested; built and verified only, without publication.'
                     return
                 }
+                // Fail closed even if the derivation above is ever changed:
+                // only main may publish, and only the declared stable version.
+                if (!isMain || publishVersion != baseVersion || publishVersion.contains('+')) {
+                    error("Refusing to publish ${publishVersion} from '${env.BRANCH_NAME}'. " +
+                          "Stable releases are published only from main.")
+                }
                 withCredentials([
                     [
                         $class           : 'AmazonWebServicesCredentialsBinding',
@@ -414,21 +442,31 @@ EOF
                     // the 'ci' image has AWS CLI v1, which cannot express
                     // If-None-Match, so a current boto3 client issues the
                     // conditional put and S3 answers 412 if the key exists.
+                    //
+                    // boto3 is installed into a throwaway --target directory
+                    // and exposed through PYTHONPATH for that one process
+                    // only.  Installing it into the image's interpreter
+                    // upgrades botocore underneath the preinstalled AWS CLI v1,
+                    // which pins botocore exactly and then fails on every
+                    // invocation -- including the readback below.
                     sh(
                         script: """
                             set -eu
-                            python -m pip install --quiet 'boto3>=1.36,<2'
-                            BUCKET='${BUCKET}' KEY='${key}' ARTIFACT='upload/${wheelName}' \
+                            rm -rf /tmp/publish-deps
+                            python -m pip install --quiet --target /tmp/publish-deps 'boto3>=1.36,<2'
+                            PYTHONPATH=/tmp/publish-deps BUCKET='${BUCKET}' KEY='${key}' ARTIFACT='upload/${wheelName}' \
                               python -c 'import os, boto3; artifact = open(os.environ["ARTIFACT"], "rb"); boto3.client("s3").put_object(Bucket=os.environ["BUCKET"], Key=os.environ["KEY"], Body=artifact, IfNoneMatch="*")'
                         """,
                         label: 'Upload wheel (no-overwrite)'
                     )
 
-                    // Read the stored object back and digest THAT, rather than
-                    // trusting the local build.  This is the SHA-256 a
+                    // Read the stored object back and verify THAT, rather than
+                    // trusting the local build: its bytes must hash to the
+                    // built digest, and the wheel's own metadata must carry
+                    // the published name and version.  This is the SHA-256 a
                     // consumer pins.  It verifies the bytes at rest in the
                     // bucket; the index front door is a pass-through over the
-                    // same object.
+                    // same object.  The system AWS CLI is used as shipped.
                     sh(
                         script: """
                             set -eu
@@ -436,12 +474,8 @@ EOF
                               --bucket ${BUCKET} \
                               --key ${key} \
                               stored.whl >/dev/null
+                            python scripts/verify-stored-wheel stored.whl '${wheelName}' '${publishVersion}' '${digest}'
                             STORED="\$(sha256sum stored.whl | cut -d' ' -f1)"
-                            LOCAL='${digest}'
-                            if [ "\$STORED" != "\$LOCAL" ]; then
-                                echo "Stored digest \$STORED does not match built digest \$LOCAL" >&2
-                                exit 1
-                            fi
                             printf '%s  %s\\n' "\$STORED" '${wheelName}' > published.sha256
                             echo "=============================================================="
                             echo " Pin this in Shell:"
