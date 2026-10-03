@@ -74,7 +74,7 @@ matches its bytes to the externally supplied digest; it does not trust optional
 installer `archive_info` and reports `commit_verified: false`. This verifies the
 referenced file, not a build linkage between that file and the installed tree.
 Do not publish this fork as `flightsql-dbapi` on a public package index. The
-internal fork version is `0.2.2.4`; see
+internal fork version is `0.2.2.5`; see
 [MAINTENANCE.md](MAINTENANCE.md) for the complete threat boundary and matrix.
 
 ## Usage
@@ -249,7 +249,7 @@ than silently weakening transport security. `insecure=true` and
 Any query parameters *not* specified in the above table will be sent to the
 upstream server as gRPC metadata.
 
-### Catalog URL migration (0.2.2.4)
+### Catalog URL migration (0.2.2.4, 0.2.2.5)
 
 The URL path filters **reflection only**, not SQL execution. It must match the
 server's default catalog: the DataFusion dialect reads
@@ -267,8 +267,19 @@ catalog; the dialect does not switch it. On InfluxDB use
 `datafusion://host:port?database=db1` for database request metadata, without `/db1`.
 Direct DB API `catalog=` only filters metadata and does not perform this check.
 
-In both literal and prepared mode with positional placeholders, raw `text()` or
-`literal_column()` fragments containing `%(name)s` are rejected with `CompileError`:
-SQLAlchemy would otherwise rewrite that text or raise `KeyError`. Pass these
-strings as bound values instead. See the
+Without a URL path, a server that only answers metadata for a named catalog is
+still reflected when it has a single catalog. With **several catalogs** and no
+readable `df_settings` (the DataFusion default), the client cannot tell which
+catalog SQL runs in, so reflection returns empty lists rather than guessing.
+Such a server therefore has no reflection until its information schema is
+enabled. The connection settles this once and does not repeat the discovery
+queries on later metadata calls.
+
+On SQLAlchemy 2, in both literal and prepared mode with positional placeholders,
+raw `text()` or `literal_column()` fragments containing `%(name)s` are rejected
+with `CompileError`: SQLAlchemy 2 would otherwise rewrite that text or raise
+`KeyError`. Pass these strings as bound values instead. SQLAlchemy 1.4 does not
+rewrite raw text for the qmark (default) or numeric paramstyles, so there such
+fragments execute unchanged. With `format` or `pyformat`, SQLAlchemy doubles
+every `%` in raw text, and this driver sends the doubled text as is. See the
 [compatibility notes](MAINTENANCE.md#datafusion-flight-sql-service-compatibility).

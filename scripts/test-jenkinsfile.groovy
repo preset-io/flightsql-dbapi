@@ -40,7 +40,7 @@ abstract class PublicationPipelineStub extends Script {
         if (step.returnStatus) return scenario.exists ? 0 : 1
         if (step.returnStdout) {
             if (step.script.contains('rev-parse')) return 'abc1234\n'
-            if (step.label == 'Read declared version') return '0.2.2.4\n'
+            if (step.label == 'Read declared version') return '0.2.2.5\n'
             if (step.label == 'Record built digest') return ('d' * 64) + '\n'
             throw new AssertionError("Unexpected stdout command: ${step}")
         }
@@ -60,11 +60,11 @@ def cases = [
     [branch: 'main', changeId: '7', release: true], // CHANGE_ID also excludes main.
     // Any other ref builds and verifies a local version and never publishes,
     // even when a release is requested: stable publication is main-only.
-    [branch: 'release-readback-awscli', version: '0.2.2.4+branch.release.readback.awscli.abc1234'],
-    [branch: 'release-readback-awscli', release: false, version: '0.2.2.4+branch.release.readback.awscli.abc1234'],
-    [branch: 'feature/nope', release: true, version: '0.2.2.4+branch.feature.nope.abc1234'],
-    [branch: 'v0.2.2.4', release: true, version: '0.2.2.4+branch.v0.2.2.4.abc1234'],
-    [branch: 'Fix/007__Hot-0', version: '0.2.2.4+branch.fix.7.hot.0.abc1234'],
+    [branch: 'release-readback-awscli', version: '0.2.2.5+branch.release.readback.awscli.abc1234'],
+    [branch: 'release-readback-awscli', release: false, version: '0.2.2.5+branch.release.readback.awscli.abc1234'],
+    [branch: 'feature/nope', release: true, version: '0.2.2.5+branch.feature.nope.abc1234'],
+    [branch: 'v0.2.2.5', release: true, version: '0.2.2.5+branch.v0.2.2.5.abc1234'],
+    [branch: 'Fix/007__Hot-0', version: '0.2.2.5+branch.fix.7.hot.0.abc1234'],
     // Mutation: if main-only gating were ever lost, the publish step still
     // refuses a non-stable version.
     [branch: 'feature/nope', release: true, exists: false, mutate: true, failure: 'Refusing to publish'],
@@ -98,7 +98,7 @@ cases.each { scenario ->
         assert script.credentialStages == ['Reject an already-published version', 'Publish wheel']
         def upload = script.shells.find { it.label == 'Upload wheel (no-overwrite)' }.script
         assert upload.contains('IfNoneMatch="*"')
-        assert upload.contains('KEY=\'flightsql-dbapi/flightsql_dbapi-0.2.2.4-py3-none-any.whl\'')
+        assert upload.contains('KEY=\'flightsql-dbapi/flightsql_dbapi-0.2.2.5-py3-none-any.whl\'')
         assert !upload.contains('+')
         assert upload.contains('--target /tmp/publish-deps')
         assert upload.contains('PYTHONPATH=/tmp/publish-deps')
@@ -106,7 +106,7 @@ cases.each { scenario ->
         assert !script.shells.any { it.script =~ /pip install[^\n]*boto3/ && !it.script.contains('--target') }
         def readback = script.shells.find { it.label == 'Digest the stored artifact' }.script
         assert readback.contains('aws s3api get-object')
-        assert readback.contains('scripts/verify-stored-wheel stored.whl \'flightsql_dbapi-0.2.2.4-py3-none-any.whl\' \'0.2.2.4\'')
+        assert readback.contains('scripts/verify-stored-wheel stored.whl \'flightsql_dbapi-0.2.2.5-py3-none-any.whl\' \'0.2.2.5\'')
         assert script.archived*.artifacts == ['published.sha256']
     } else if (scenario.failure == 'already published') {
         assert script.credentialStages == ['Reject an already-published version']
@@ -122,7 +122,7 @@ cases.each { scenario ->
     }
     if (scenario.branch.startsWith('PR-') || scenario.changeId) {
         def install = script.shells.find { it.label == 'Install and inspect artifact' }.script
-        assert install.contains('0.2.2.4+')
+        assert install.contains('0.2.2.5+')
     }
     if (scenario.version) {
         def install = script.shells.find { it.label == 'Install and inspect artifact' }.script
@@ -133,7 +133,7 @@ cases.each { scenario ->
     }
     if (scenario.branch == 'main' && !scenario.changeId && !scenario.failure) {
         def install = script.shells.find { it.label == 'Install and inspect artifact' }.script
-        assert install.contains('assert dist.version == "0.2.2.4"')
+        assert install.contains('assert dist.version == "0.2.2.5"')
         assert !script.shells.any { it.label == 'Apply local test version' }
     }
     script.shells.each { step ->
