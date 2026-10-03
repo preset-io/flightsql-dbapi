@@ -47,9 +47,12 @@ def main(argv):
                     errors.append(f"wheel metadata Name {headers['Name']!r} does not match {name!r}")
                 if headers["Version"] != version:
                     errors.append(f"wheel metadata Version {headers['Version']!r} != {version!r}")
-    except (OSError, zipfile.BadZipFile, zlib.error, EOFError, UnicodeDecodeError) as error:
-        # Corrupt compressed data or non-UTF-8 METADATA is a bad artifact, not a crash.
+    except (OSError, zipfile.BadZipFile, zlib.error, EOFError) as error:
+        # Corrupt compressed data or a truncated member is a bad artifact, not a crash.
         errors.append(f"stored object is not a readable wheel: {error}")
+    except UnicodeDecodeError as error:
+        # Undecodable METADATA is likewise a bad artifact; say which one it is.
+        errors.append(f"wheel METADATA is not valid UTF-8: {error}")
 
     for error in errors:
         print(f"verify-stored-wheel: {error}", file=sys.stderr)
