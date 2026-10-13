@@ -39,20 +39,29 @@ def main(argv):
             if len(metadata_files) != 1:
                 errors.append(f"expected one METADATA file in the wheel, found {metadata_files}")
             else:
-                headers = email.parser.Parser().parsestr(
-                    wheel.read(metadata_files[0]).decode("utf-8"), headersonly=True
-                )
-                normalized = headers["Name"].replace("-", "_").lower() if headers["Name"] else None
-                if normalized != name.lower():
-                    errors.append(f"wheel metadata Name {headers['Name']!r} does not match {name!r}")
-                if headers["Version"] != version:
-                    errors.append(f"wheel metadata Version {headers['Version']!r} != {version!r}")
-    except (OSError, zipfile.BadZipFile, zlib.error, EOFError) as error:
-        # Corrupt compressed data or a truncated member is a bad artifact, not a crash.
+                metadata_bytes = wheel.read(metadata_files[0])
+                try:
+                    metadata = metadata_bytes.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    errors.append(f"{metadata_files[0]} is not valid UTF-8: {error}")
+                else:
+                    headers = email.parser.Parser().parsestr(metadata, headersonly=True)
+                    normalized = headers["Name"].replace("-", "_").lower() if headers["Name"] else None
+                    if normalized != name.lower():
+                        errors.append(f"wheel metadata Name {headers['Name']!r} does not match {name!r}")
+                    if headers["Version"] != version:
+                        errors.append(f"wheel metadata Version {headers['Version']!r} != {version!r}")
+    except (
+        OSError,
+        zipfile.BadZipFile,
+        zlib.error,
+        EOFError,
+        UnicodeDecodeError,
+        RuntimeError,
+        NotImplementedError,
+    ) as error:
+        # Unreadable archives or members are bad artifacts, not crashes.
         errors.append(f"stored object is not a readable wheel: {error}")
-    except UnicodeDecodeError as error:
-        # Undecodable METADATA is likewise a bad artifact; say which one it is.
-        errors.append(f"wheel METADATA is not valid UTF-8: {error}")
 
     for error in errors:
         print(f"verify-stored-wheel: {error}", file=sys.stderr)

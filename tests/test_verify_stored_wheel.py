@@ -64,7 +64,42 @@ def test_corrupt_deflate_fails_cleanly_without_a_traceback(tmp_path):
 
 def test_non_utf8_metadata_fails_cleanly_without_a_traceback(tmp_path):
     data = _wheel(METADATA + b"Summary: \xff\xfe\n")
-    _assert_clean_failure(_verify(tmp_path, data), "wheel METADATA is not valid UTF-8")
+    _assert_clean_failure(_verify(tmp_path, data), f"{METADATA_NAME} is not valid UTF-8")
+
+
+def test_non_utf8_member_name_fails_as_unreadable_wheel(tmp_path):
+    data = _wheel()
+    # Mark the first member's name as UTF-8 in both ZIP headers, then invalidate it.
+    local = data.index(b"PK\x03\x04")
+    central = data.index(b"PK\x01\x02")
+    for header, flags_offset, name_offset in [(local, 6, 30), (central, 8, 46)]:
+        flags = struct.unpack_from("<H", data, header + flags_offset)[0]
+        struct.pack_into("<H", data, header + flags_offset, flags | 0x800)
+        data[header + name_offset] = 0xFF
+    result = _verify(tmp_path, data)
+    _assert_clean_failure(result, "not a readable wheel")
+    assert "is not valid UTF-8" not in result.stderr
+    assert "METADATA" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "local_offset,central_offset,value,message",
+    [
+        (6, 8, 1, "encrypted"),
+        (8, 10, 99, "compression method"),
+    ],
+    ids=["encrypted-metadata", "unsupported-compression"],
+)
+def test_unreadable_metadata_member_fails_cleanly(tmp_path, local_offset, central_offset, value, message):
+    data = _wheel()
+    # METADATA is the second member; patch its local and central headers consistently.
+    local = data.index(b"PK\x03\x04", data.index(b"PK\x03\x04") + 4)
+    central = data.index(b"PK\x01\x02", data.index(b"PK\x01\x02") + 4)
+    struct.pack_into("<H", data, local + local_offset, value)
+    struct.pack_into("<H", data, central + central_offset, value)
+    result = _verify(tmp_path, data)
+    _assert_clean_failure(result, "not a readable wheel")
+    assert message in result.stderr
 
 
 def test_truncated_wheel_fails_cleanly_without_a_traceback(tmp_path):
@@ -94,3 +129,4 @@ def test_version_disagreement_still_fails(tmp_path, version):
     result = _verify(tmp_path, _wheel(), version=version)
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
+    assert "wheel metadata Version" in result.stderr
